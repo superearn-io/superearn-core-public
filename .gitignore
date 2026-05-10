@@ -1,0 +1,28 @@
+# Foundry build artifacts
+cache/
+out/
+broadcast/
+
+# Coverage
+coverage/
+lcov.info
+
+# Node
+node_modules/
+yarn.lock
+package-lock.json
+
+# Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local env
+.env
+.env.*
+!.env.example
+
+.omc/
+
+# Local LLM workspace files (private)
+CLAUDE.md

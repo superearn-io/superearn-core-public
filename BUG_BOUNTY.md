@@ -1,0 +1,357 @@
+# **SuperEarn Bug Bounty Program**
+
+## **Program Overview**
+
+SuperEarn is a crosschain yield aggregation protocol that allows users on **Kaia** to access yield opportunities on both **Kaia** and **Ethereum** through an asynchronous request/fulfill/claim vault architecture. Users deposit on Kaia, and the Kaia Yearn V2 layer routes capital either (a) to a Kaia-native `CustomVault` / `CustomYearnStrategy` wrapper or (b) crosschain to Ethereum via `StrategyOriginVault` → `OriginVault` → `RemoteVault`. Yield from the Ethereum side is reflected back to the origin vault via a state-piggybacked messaging layer (Chainlink CCIP).
+
+This bounty round focuses on the **internal vault accounting + crosschain messaging / bridge layer** — the surfaces where a defect produces direct, non-recoverable fund-loss or accounting drift across chains. External yield strategies (asset providers, Morpho/Pendle/Yield8 integrations) that are bounded by a trusted-strategist execution allowlist or by helper-OOS semantics are excluded from this round.
+
+The protocol is built on the layered stack: **SuperEarnRouter → CooldownVault → Yearn V2 Vault → Strategy → (Kaia-native yield source | OriginVault → Ethereum)**, with dedicated crosschain components (`OriginVault`, `RemoteVault`, `CrosschainAdapter`, `BridgeAccountant`, `SuperEarnMessageAgent`) that move USDT between chains and reconcile state when the crosschain path is used.
+
+The codebase has been audited by Certik three times — `2026.02.19` (base + crosschain layer, 52 findings), `2026.04.07` (Pendle PT diamond + StrategyMorphoV2Vault + CustomStrategy + RemoteVault deltas, 67 findings), and `2026.04.28` (Strategy Audit — `CustomVault` + `CustomYearnStrategy`, 18 findings). The full reports are public at [github.com/superearn-io/superearn-audit-reports](https://github.com/superearn-io/superearn-audit-reports). Researchers are expected to read all three reports — in particular the **"Known Issues / Acknowledged Design Decisions"** section below — before submitting; previously-reviewed items are not eligible for bounty unless the report demonstrates a materially different exploit path.
+
+This document manages and tracks security vulnerability reports submitted through the SuperEarn Bug Bounty program.
+
+## **Rewards**
+
+| Severity | Bounty Range |
+| ----- | ----- |
+| Critical | $5,000 \- $30,000 |
+| High | $2,000 \- $10,000 |
+| Medium | $300 \- $2,000 |
+| Low | $100 \- $500 |
+
+**Total Bounty Range**: $100 \- $30,000
+
+> The exact reward depends on the affected contract's category (see "Severity Classification" below). Category 1 (Crosschain & Vault Layer) carries the higher end of each tier — Critical $10k-$30k, High $3k-$10k, Medium $500-$2k, Low $200-$500. Category 2 (Single-Chain Vault & Strategy Layer, Kaia) carries — Critical $5k-$20k, High $2k-$5k, Medium $300-$1k, Low $100-$300. A finding gets evaluated under the category of the affected contract, not under the global table.
+
+## **Severity Classification**
+
+This classification is tailored to SuperEarn's system characteristics, referencing Immunefi Vulnerability Severity Classification System v2.3 and Kaia Bug Bounty Policy.
+
+### **Core Principles**
+
+1. **Impact-based assessment**: Severity is determined by the actual exploitable impact of the vulnerability
+2. **Crosschain architecture considerations**: Bridge and crosschain messaging layers carry the highest blast radius because compromised state cannot be unilaterally rolled back on either chain
+3. **Category-based classification**: Two domains — Crosschain & Vault Layer, Single-Chain Vault & Strategy Layer. Periphery / helper contracts (keepers, price converters, swap routers, asset providers, healthcheck, batch executors, registries) are **out of scope** as standalone targets; impacts that propagate from a helper into a vault or strategy are evaluated under the corresponding vault/strategy category.
+4. **Practical exploitability**: Based on actually achievable impact, not theoretical scenarios
+5. **Permissioned entry-points**:
+   * `OriginVault` whitelist (`onlyWhitelistedShareholder` on `deposit` / `mint`) gates the **entry side only** — only `StrategyOriginVault` (and `GOVERNANCE_ROLE`) can mint OriginVault shares. The redemption side (`requestRedeem` / `redeem`) is gated by ERC-7540 controller / `isOperator[owner][delegate]` checks, **not** by the whitelist; in practice only StrategyOriginVault holds shares so this distinction is academic, but a "redeem isn't whitelist-gated" report is therefore not a finding.
+   * `CooldownVault` and the strategies that wrap it: gated by an authorized-address allowlist (`onlyAuthorized`, enumerate via `getAuthorizedAddresses()`).
+   * `CustomVault`: ERC4626 user paths gated to a single bound `CustomYearnStrategy` (`onlyCustomYearnStrategy`); `depositToCustomStrategy` / `withdrawFromCustomStrategy` are gated by a **separate** `onlyOperator` modifier that uses CustomVault's own `operators` mapping + governance fallback (this is **not** the same as `onlyOperators` on the rest of the codebase — see the "operator" disambiguation below).
+   * `RemoteVault`: role-based access control via `SuperEarnAccessControl` — `GOVERNANCE_ROLE` for emergency paths, `MANAGEMENT_ROLE` (`onlyManagers`) for ops, `onlyOperators` (= GOVERNANCE / MANAGEMENT / KEEPER) for keeper paths, `SYSTEM_CONTRACT_ROLE` (`onlySystemContract`) for inter-contract handlers like `handleWithdrawRequest`. The legacy `whitelistedDepositors` mapping has been removed; that storage slot is now occupied by `unfulfilledWithdrawalAmount`.
+
+   **Disambiguation — three different "operator" concepts in the codebase:**
+   1. **`onlyOperators`** (plural, `SuperEarnAccessControl`) — protocol-level role check; passes for GOVERNANCE / MANAGEMENT / KEEPER. Used on `OriginVault`, `RemoteVault`, `CrosschainAdapter` keeper paths.
+   2. **`onlyOperator`** (singular, `CustomVault` only) — checks CustomVault's local `operators` mapping plus the governance address. Distinct from #1; manage by governance only.
+   3. **`isOperator[owner][delegate]`** (`OriginVault` ERC-7540 delegation mapping) — per-user delegation, set via `setOperator(address, bool)` by the share owner. Lets one address request/claim redemptions on behalf of another. **Not** a protocol role.
+
+   A finding that requires bypassing any of these gates is in scope; a finding that only works with an authorized caller acting maliciously, or that conflates the three "operator" surfaces above, is generally out of scope (see "Trust Assumptions" below).
+
+### **Category 1: Crosschain & Vault Layer**
+
+Crosschain bridge contracts (`CrosschainAdapter`, `BridgeAccountant`, `SuperEarnMessageAgent`, Runespear messaging — note: `BridgeQueue` is a Solidity `library` linked into `CrosschainAdapter`, not a standalone deployment), the asynchronous vaults (`OriginVault`, `RemoteVault`), and the Yearn-integrating strategy that bridges them (`StrategyOriginVault`).
+
+**Highest bounty tier.** This layer carries user funds across chains and is the only layer where state divergence cannot be locally remediated. Exploits here can permanently freeze, double-credit, or drain bridged assets.
+
+| Level | Bounty | Impact |
+| ----- | ----- | ----- |
+| **Critical** | $10,000 \- $30,000 | Direct theft or permanent freeze of bridged assets, double-spend across chains |
+| **High** | $3,000 \- $10,000 | Temporary fund freeze, indirect financial loss, cross-chain accounting drift causing mispriced redemptions |
+| **Medium** | $500 \- $2,000 | Unintended behaviour without direct fund risk |
+| **Low** | $200 \- $500 | Minor impact |
+
+### **Category 2: Single-Chain Vault & Strategy Layer (Kaia only)**
+
+**Kaia-side** local-chain vault and strategy contracts: `CooldownVault` (Kaia), `SuperEarnRouter` (Kaia), `BaseCooldownStrategy` and the **Kaia-deployed** concrete strategies (`StrategyOriginVault`, `CustomYearnStrategy`), `CustomVault`, `USDOKycedCA` (Kaia).
+
+> **Ethereum-side strategy stack is out of scope** for two distinct reasons (see "Out of Scope — Contracts" below for the precise list):
+> - The **Yearn-vault-attached path** (`SuperEarnRouter` ETH → `CooldownVault` USDC/USDT → Ethereum Yearn vaults → `StrategyMorphoV2Vault` + `YearnVaultManager` USDC/USDT) is **currently unfunded** — capital bridged from Kaia stays in `RemoteVault` or flows directly into the registered `CustomStrategy` deployments rather than through this Yearn-attached pipeline.
+> - The three Ethereum `CustomStrategy` deployments (USDC Multi-Morpho, USDT Multi-Morpho, Pendle PT-USDG) **are funded** and are registered directly with `RemoteVault` via `_calculateCustomStrategyAssets()`. They are out of scope as **external-yield strategies** whose risk surface is bounded by the strategist execution allowlist and external-protocol trust assumptions (Morpho V2, Morpho Blue, Pendle). `RemoteVault`'s aggregation accounting that consumes their `totalAssets()` remains in scope.
+
+**Mid-high bounty tier.** Issues at this layer affect funds inside one chain only, and the protocol's two-step withdraw flow (request → cooldown → claim), reserve ratio, and FIFO claim-ordering reservation provide some recovery surface. They still carry direct fund-loss risk if exploited.
+
+| Level | Bounty | Impact |
+| ----- | ----- | ----- |
+| **Critical** | $5,000 \- $20,000 | Direct theft of vault assets, permanent freeze of user funds within a single chain |
+| **High** | $2,000 \- $5,000 | Indirect financial loss, partial freeze, mispriced strategy accounting |
+| **Medium** | $300 \- $1,000 | Limited misbehaviour with no direct fund risk |
+| **Low** | $100 \- $300 | Minor impact |
+
+### **Periphery & Helper Contracts — Out of Scope**
+
+Off-vault helpers — keepers (`LightKeeper`, `CrosschainKeeper`), price converters (`AssetPriceConverter`, `OraklAssetPriceConverter`), `UniversalSwapRouter`, custom-strategy registries (`CustomStrategyHelper`, `MultiMorphoCustomStrategyHelper`), assets providers (`Yield8AssetsProvider`, `MultiMorphoDirectAssetsProvider`, `PendleUSDGAssetsProvider`), `HealthCheck`, `TimelockExecutionLib`, `BatchExecutor` — are **not standalone bounty targets** under this program.
+
+A finding whose root cause is *only* in a helper (e.g. a price converter returning a wrong value, a keeper griefing scenario, an asset provider revert) is **out of scope** and not eligible for a bounty. If a helper defect propagates into a Category 1 or Category 2 contract and produces a fund-loss / freeze / accounting-drift impact at the vault or strategy level, file the report against the affected vault/strategy and assess severity under that category.
+
+## **Scope**
+
+### **In Scope — Kaia Mainnet (Chain ID: 8217)**
+
+| Target | Type | Severity | Reward |
+| ----- | ----- | ----- | ----- |
+| [0x3B37DB3AC2a58f2daBA1a7d66d023937d61Fc95b](https://kaiascan.io/address/0x3B37DB3AC2a58f2daBA1a7d66d023937d61Fc95b) (OriginVault) | Smart Contract | Critical | Bounty |
+| [0x55CEd8F290256E165d3f50EDa0b60E261ec38f55](https://kaiascan.io/address/0x55CEd8F290256E165d3f50EDa0b60E261ec38f55) (BridgeAccountant) | Smart Contract | Critical | Bounty |
+| [0x8E53CdAa89381c203a074fB3388f65936358f200](https://kaiascan.io/address/0x8E53CdAa89381c203a074fB3388f65936358f200) (CrosschainAdapter) | Smart Contract | Critical | Bounty |
+| [0xd8acFF2E2B8B1Cf052aca4Ba331743F73C569E68](https://kaiascan.io/address/0xd8acFF2E2B8B1Cf052aca4Ba331743F73C569E68) (SuperEarnMessageAgent) | Smart Contract | Critical | Bounty |
+| [0x4E4654cE4Ca7ff0ba66a0A4a588A4bd55A6f9A33](https://kaiascan.io/address/0x4E4654cE4Ca7ff0ba66a0A4a588A4bd55A6f9A33) (CooldownVault) | Smart Contract | Critical | Bounty |
+| [0x7437892A3e2E658038758dD7CA638334C0c2006C](https://kaiascan.io/address/0x7437892A3e2E658038758dD7CA638334C0c2006C) (SuperEarnRouter) | Smart Contract | High | Bounty |
+| [0x650a4c074a58B18fbEEd48ae766e58a382D9E5F5](https://kaiascan.io/address/0x650a4c074a58B18fbEEd48ae766e58a382D9E5F5) (StrategyOriginVault) | Smart Contract | Critical | Bounty |
+| [0x723d3422788f47f5DaE153515A3C277293dbd8f3](https://kaiascan.io/address/0x723d3422788f47f5DaE153515A3C277293dbd8f3) (CustomYearnStrategy) | Smart Contract | Critical | Bounty |
+| [0x7876a2faf6Aad1F6F8E47AD612D9472a4821DfDa](https://kaiascan.io/address/0x7876a2faf6Aad1F6F8E47AD612D9472a4821DfDa) (CustomVault) | Smart Contract | Critical | Bounty |
+| [0x4Bfc1773280689d17c8c00B2514A5C28c8c2b021](https://kaiascan.io/address/0x4Bfc1773280689d17c8c00B2514A5C28c8c2b021) (USDOKycedCA) | Smart Contract | High | Bounty |
+
+### **In Scope — Ethereum Mainnet (Chain ID: 1)**
+
+| Target | Type | Severity | Reward |
+| ----- | ----- | ----- | ----- |
+| [0x8c82B2feC291a43e41aA87669eaEf01F4efaA3B2](https://etherscan.io/address/0x8c82B2feC291a43e41aA87669eaEf01F4efaA3B2) (RemoteVault) | Smart Contract | Critical | Bounty |
+| [0x40FB0F9084828ADBc3dcd71840eA545BF243cD0F](https://etherscan.io/address/0x40FB0F9084828ADBc3dcd71840eA545BF243cD0F) (BridgeAccountant) | Smart Contract | Critical | Bounty |
+| [0xC090e88bDAA823B7C1dd8d9e24CbacB0f35f2675](https://etherscan.io/address/0xC090e88bDAA823B7C1dd8d9e24CbacB0f35f2675) (CrosschainAdapter) | Smart Contract | Critical | Bounty |
+| [0x4AFd6Ad5b924CD29513d1fb9b66728C4C5A1bd3e](https://etherscan.io/address/0x4AFd6Ad5b924CD29513d1fb9b66728C4C5A1bd3e) (SuperEarnMessageAgent) | Smart Contract | Critical | Bounty |
+
+### **Out of Scope — Contracts**
+
+The following deployed contracts are explicitly **out of scope** for this program:
+
+* **Ethereum Yearn-vault-attached path (currently unfunded)** — `SuperEarnRouter` (ETH), `CooldownVault` (USDC / USDT), `YearnVaultManager` (USDC / USDT), `StrategyMorphoV2Vault`. No capital flows through this pipeline at present; it will be brought back into scope when actively funded and after a separate review pass.
+* **Ethereum direct-registered `CustomStrategy` deployments (funded but external-yield-bounded)** — `CustomStrategy` USDC Multi-Morpho, USDT Multi-Morpho, Pendle PT-USDG. These contracts hold positions in third-party protocols (Morpho V2, Morpho Blue, Pendle V2) and are registered directly with `RemoteVault`; their risk surface is bounded by the strategist execution allowlist and external-protocol trust. Defects contained to the strategy implementation are out of scope; see also the "External-yield Yearn strategies" entry below for the boundary against in-scope `RemoteVault` aggregation accounting.
+* **`USDOKycedCA` (Ethereum)** — KYC mint/redeem queue for the Ethereum-side OpenEden cUSDO path. Out of scope for this round irrespective of current funding (the Kaia `USDOKycedCA` deployment remains in scope under Category 2). `RemoteVault` itself remains in scope under Category 1.
+* **`YearnVaultManager` (both chains)** — debt-ratio rebalance manager. Does not custody assets and acts only through privileged calls into the upstream Yearn V2 `Vault.vy` (an out-of-scope dependency). Operationally controlled via Management; impacts that propagate from a `YearnVaultManager` mis-configuration into a Category 1 / Category 2 contract and produce a fund-loss / freeze / accounting-drift result are evaluated under the affected vault/strategy.
+* **External-yield strategies** — `StrategyUSDOExpressV2` (Kaia, OpenEden USDO direct mint/redeem; deployed but the Kaia Yearn-debt-ratio for it is currently 0) and the `CustomStrategy` deployments (Kaia Yield8, plus the Ethereum Multi-Morpho USDC / USDT and Pendle PT-USDG deployments — **all of which currently hold funds** and are registered with their respective vaults). These strategies hold positions in third-party protocols whose risk surface is bounded by the strategist execution allowlist (`assetsChangeTolerance`, target allowlist, self-call protection) and by the trusted-strategist assumption. Defects contained to the strategy implementation are out of scope; defects that escape `assetsChangeTolerance` or the allowlist and propagate fund loss into the wrapping `CustomVault` / `RemoteVault` accounting are in scope under the affected vault.
+* **Periphery & helper contracts** — `LightKeeper`, `CrosschainKeeper`, `AssetPriceConverter`, `OraklAssetPriceConverter`, `UniversalSwapRouter`, `CustomStrategyHelper`, `MultiMorphoCustomStrategyHelper` (USDC/USDT), `Yield8AssetsProvider`, `MultiMorphoDirectAssetsProvider` (USDC/USDT), `PendleUSDGAssetsProvider`, `HealthCheck`, `TimelockExecutionLib`, `BatchExecutor`. A defect that *propagates* into a Category 1 / Category 2 contract and produces a fund-loss / freeze / accounting-drift impact at the vault or strategy level is in scope under the affected vault/strategy; a defect that is contained to the helper itself is not.
+* **Yearn V2 vaults and registry** (`Vault.vy`, `Registry.vy`) — unmodified upstream Yearn code. Treated as a trusted dependency
+* **Morpho V1 strategies** (`StrategyMorphoV1Vault` — Core / Prime / RWA on Ethereum) — out of scope for this round
+* **Pendle PT Diamond strategy** — `PendlePTDiamond` and all `PendlePT*Facet` contracts (Yearn / Core / Cooldown / Execution / EmergencyExecution), `DiamondCutFacet`, `DiamondLoupeFacet`, `LibPendlePTStorage`, `LibDiamond`, and per-asset Pendle PT diamonds (sNUSD / cUSD / cUSDO)
+* **Pendle PT swappers** — `USDCToSNUSDCurveSwapper`, `USDCToCUSDOSwapper`, `USDTToSUSDeSwapper`, `USDCToSrUSDeSwapper`
+* **External protocols** — Morpho Blue, Morpho V2 vaults, Pendle V2, OpenEden cUSDO, Cap Protocol, Ethena, Neutrl, Curve, Uniswap V3/V4, Fluid DEX, Chainlink CCIP, Orakl
+* **Off-chain components** — keeper bots, monitoring, frontend, indexers
+
+### **Network**
+
+* **Chains**: Kaia (8217), Ethereum (1)
+* **Crosschain messaging**: Chainlink CCIP via the Runespear protocol wrapper
+* **Bridge** (in-scope path): the single crosschain transfer route in production is **USDT via Rhino.fi smart-deposit address**, routed by `CrosschainAdapter.sendAssets(token=USDT, amount, dstChain)` on each side. The `bridgeToken` is set as `immutable` at constructor time to a single asset (USDT) — `CrosschainAdapter` does not route any other token. The protocol's crosschain transfers are USDT-only by design.
+
+### **Source Code**
+
+* **Repository**: [github.com/superearn-io/superearn-core](https://github.com/superearn-io/superearn-core) (private — access provided to invited researchers)
+* **Branches under active deployment**: `develop`, `kaia/custom-strategy`
+* **Reference audit specifications**:
+  * `audit/dec-11/audit-request-part-a-base.md` — CooldownVault, BaseCooldownStrategy, StrategyOriginVault, SuperEarnRouter
+  * `audit/dec-11/audit-request-part-b-crosschain.md` — OriginVault, RemoteVault, CrosschainAdapter, BridgeAccountant, BridgeQueue (library), SuperEarnMessageAgent, Runespear messaging
+  * `audit/audit-spec-part-d-custom-strategy.md` — CustomStrategy and RemoteVault custom-strategy additions
+  * `audit/audit-spec-part-e-morpho-v2.md` — StrategyMorphoV2Vault
+  * `audit/audit-spec-part-f-custom-yearn-strategy.md` — CustomYearnStrategy and CustomVault (Kaia)
+* **Public audit reports**:
+  * Certik 2026-02-19 (Base + Crosschain layer): `superearn-io/superearn-audit-reports/2026.02.19-certik.pdf`
+  * Certik 2026-04-07 (Pendle PT diamond + StrategyMorphoV2Vault + CustomStrategy + RemoteVault deltas): `superearn-io/superearn-audit-reports/2026.04.07-certik.pdf`
+  * Certik 2026-04-28 (Strategy Audit — CustomVault + CustomYearnStrategy): `superearn-io/superearn-audit-reports/2026.04.28-certik.pdf`
+
+### **Build Environment**
+
+The codebase compiles deterministically with the toolchain below. Reports should reproduce the finding under the same configuration so that the bytecode used for the PoC matches mainnet.
+
+| Setting | Value | Source |
+| --- | --- | --- |
+| Solidity compiler | `0.8.29` | `foundry.toml` |
+| EVM version | `Cancun` | `foundry.toml` |
+| Optimizer | enabled | `foundry.toml` |
+| Optimizer runs | `250` | `foundry.toml` |
+| `via_ir` | `true` (required — several crosschain contracts trip stack-too-deep without it) | `foundry.toml` |
+| `bytecode_hash` | `none` | `foundry.toml` |
+| Foundry | `forge >= 0.2.0` | `README.md` §7 |
+
+**Key dependency pins** (resolved via `package.json` + git submodules at the deployed commit):
+
+| Dependency | Version / Commit |
+| --- | --- |
+| `@openzeppelin/contracts` | `5.3.0` |
+| `@openzeppelin/contracts-upgradeable` | `4.9.4` (aliased to `@openzeppelin/contracts-upgradeable-4.9.4` in `package.json`) |
+| `@chainlink/contracts` | `^1.4.0` |
+| `@chainlink/contracts-ccip` | `^1.6.1` |
+| `@bisonai/orakl-contracts` | `^2.0.2` |
+| `@uniswap/v3-periphery` | `^1.4.4` |
+| `@uniswap/v4-core` | `^1.0.2` |
+| `@uniswap/v4-periphery` | `^1.0.3` |
+| `forge-std` (npm devDep) | `v1.9.7` (`github:foundry-rs/forge-std#v1.9.7`) |
+| `metamorpho` (submodule) | `v1.0.0` — commit `f5faa9c21b1396c291b471a6a5ad9407d23486a9` |
+| Yearn V2 `BaseStrategy` (vendored) | `src/yearn-vaults/BaseStrategy.sol`, adapted for `pragma solidity >=0.8.29` and SuperEarn-specific imports (`IBaseFeeOracle`, `IStrategy`, `IVault`, `IHealthCheck`). The Yearn `CommonHealthCheck` and the SuperEarn concrete `HealthCheck` are out of scope and have been removed from this repository; in-scope contracts depend only on the `IHealthCheck` interface. Live `profitLimitRatio` / `lossLimitRatio` per chain are documented in `README.md` §9.4. |
+
+A finding that only manifests under a different compiler version, `via_ir` setting, or optimizer-runs value than the table above is **not in scope** unless the report demonstrates that the deployed bytecode actually exhibits the same defect.
+
+---
+
+## **Focus Area**
+
+### **In Scope Vulnerabilities: Smart Contracts**
+
+**Crosschain & bridge accounting**
+
+* Unauthorized cross-chain message authorship, replay, or reordering with financial impact
+* Bridge accounting drift in `BridgeAccountant` — over-/under-counting of `assetsInTransitOutbound()` / `assetsInTransitInbound()` (and the per-vault helpers `OriginVault.assetsInTransitToRemote()` / `RemoteVault.assetsInTransitToOrigin()`), double-credit, or missed `SYNC_BRIDGED` reconciliation in the `_awaitingAssetQueue`
+* Forging `SYNC_BRIDGED` (defined in `RunespearProtocol`) or `WITHDRAW` (defined in `SuperEarnV2Protocol`) envelopes that bypass `SuperEarnMessageAgent.delegate(sourceChainId, predicate, args, messageId, envelope)` — adapter-only entry, gated by `if (msg.sender != address(adapter)) revert OnlyAdapter()` — and reach `_routeWithdraw → RemoteVault.handleWithdrawRequest` with attacker-controlled payload. Note: unknown predicates emit `UnknownPredicateReceived` (no revert), so a forged-predicate finding must show a real impact, not just successful event emission. There is no separate `DEPOSIT` envelope — deposit-direction transfers are reconciled by `SYNC_BRIDGED` + balance check.
+* Reordering or nonce manipulation on `CrosschainAdapter` outbound / inbound queues (note: there is no per-message signature — authentication is via Chainlink CCIP source-chain selector + `RunespearProtocol` envelope)
+* Spoofed `CrosschainAdapter.onBridgeReceived` / `_processBridgeReceived` / `forceProcessBridgeReceipt` that bypasses `BridgeAccountant` invariants (the `_awaitingAssetQueue` reconciliation, `BridgeQueue` library nonce tracking)
+
+**Vault entry / exit accounting**
+
+* Stealing or loss of user funds across `SuperEarnRouter` (Kaia) → `CooldownVault` (Kaia) → Yearn → `StrategyOriginVault` → `OriginVault` flow
+* Whitelist or access-control bypass on `OriginVault` / `RemoteVault` / `CooldownVault` / `CustomVault`
+* Share-supply manipulation breaking the 1:1 invariant in `CooldownVault`
+* FIFO claim-reservation bypass in `CooldownVault` / `OriginVault` redemption queues
+* `predeposit` / `retrieveDebt` accounting bug that leaves debt unrepayable or double-paid
+* `CustomVault.totalAssets()` mispricing through the registered `ICustomStrategy` aggregation path (the registered providers themselves are out of scope, but accounting bugs in `CustomVault`'s aggregation are in scope)
+* `RemoteVault.totalAssets()` mispricing or `_calculateCustomStrategyAssets()` accounting drift driven by an in-vault bug (not by a defect in the registered, OOS, custom-strategy implementation)
+* `StrategyOriginVault.estimatedTotalAssets()` / `prepareReturn()` / `liquidatePosition()` mispricing that propagates a wrong harvest P&L into the Kaia Yearn vault
+
+**Common surfaces**
+
+* Reentrancy across `vault → bridge → vault` and `router → vault → strategy` boundaries
+* Decimal handling errors (USDT 6-decimal ↔ 18-decimal `OriginVault` share token, and any 6-decimal asset ↔ vault-share conversion in `CustomVault` / `RemoteVault.totalAssets`)
+* Storage-collision or initialization issues in upgradeable proxies
+* Rounding / over-/underflows that compound into material loss
+* `USDOKycedCA` mint/redeem queue manipulation (Kaia)
+
+### **Out of Scope: Smart Contracts**
+
+* Items listed in the **"Known Issues / Acknowledged Design Decisions"** section below — these are acknowledged as intentional design, deliberately excluded from the codebase, or operationally mitigated. Re-reports without a *materially different* exploit path are not eligible.
+* Theoretical vulnerabilities without proof, demonstration, or runnable PoC
+* Vulnerabilities exclusively exploitable via front-running on a public mempool, when the contract uses standard MEV-aware patterns (2-step request/claim, `minOut`, etc.)
+* Findings that require a privileged role (governance, management, keeper, strategist) to act against the protocol — see Trust Assumptions
+* Centralization / "no timelock" / "owner can do X" findings — already mitigated via 4/5 (Governance) and 2/3 (Management) Gnosis Safes
+* Findings that require modification of the deployed Yearn V2 `Vault.vy` / `Registry.vy` Vyper code
+* Findings against external protocols' implementations (Morpho, Pendle, Curve, Uniswap, OpenEden, Ethena, Neutrl, Cap, Fluid, CCIP, Orakl, Rhino)
+* Findings against any contract listed under "Out of Scope — Contracts" above
+* Generic best-practice issues without exploit impact (gas optimization, code style, redundant code, missing event — note: see SUA-10 for `CooldownVault`'s deliberate non-strict-ERC4626 stance)
+* Compiler-version pinning, unlocked pragma, or other meta-issues
+* Vulnerabilities in imported libraries (OpenZeppelin v5, Chainlink CCIP) that do not have a SuperEarn-specific exploit path
+* Permanent freeze where the only avenue is governance failure (governance is multi-sig)
+* Findings that require a temporary / permanent depeg of underlying stablecoins (USDT, USDC, USDO) — temporary depeg is anticipated; permanent depeg is treated as systemic risk
+* Findings that hinge on bridge-service operational behaviour (Rhino smart deposit address rotation, CCIP delivery timing) without a contract-level invariant violation
+
+### **Known Issues / Acknowledged Design Decisions (NOT eligible for bounty)**
+
+The following items are referenced by Certik audit IDs (see reports `2026.02.19-certik.pdf` / `2026.04.07-certik.pdf` / `2026.04.28-certik.pdf` in `superearn-io/superearn-audit-reports`). Each item is either **acknowledged as intentional design**, **deliberately not present in the codebase**, or **mitigated operationally**. Re-reports of these items will be marked Out of Scope and are not eligible for a bounty unless the report demonstrates a *materially different* exploit path against the current code.
+
+**A. Acknowledged design trade-offs — DO NOT re-report**
+
+| ID | Area | Item | Rationale |
+| --- | --- | --- | --- |
+| SUA-11 | OriginVault | Redemption queue locks `requestedAssets` at `requestRedeem()` via `convertToAssets(shares)`; if NAV drops between request and fulfillment, the head-of-queue cannot be fulfilled. | Intentional — gains/losses are socialized across remaining users so per-user redemption price is predictable. Bridge-fee variance absorbed at the protocol level. |
+| SUA-01 | CooldownVault | `recoverClaimLoss()` mints replacement shares to the governance address rather than to the user who incurred the loss in `_claim()`. The sibling `recover()` function similarly lets governance withdraw idle USDC while respecting outstanding reservations. | Acknowledged. Both `recoverClaimLoss()` and `recover()` are governance-only (`onlyGovernance`, 4/5 Gnosis Safe) and the recovered assets/shares are redistributed off-chain by the protocol team. Findings framed as "governance can withdraw idle USDC" or "governance does not auto-credit the loss to the user" are OOS. |
+| SUA-13 | CooldownVault | A malicious strategy could mint shares via `predeposit()` then drain idle liquidity via `instantRedeem()`. | All strategies are internally developed/operated; predeposit is only used in conjunction with withdrawals. New strategies undergo separate review before authorization. |
+| SUA-43 | RemoteVault | `RemoteVault`'s emergency rescue entry points (`emergencyWithdrawFromYearn(uint256 maxLoss, bool isUsdc)`, `emergencyBridgeAssetsToOrigin(uint256 amount)`, `emergencyRecoverToken(token, to, amount)`) can move assets without decrementing `unfulfilledWithdrawalAmount`. | Acknowledged. All emergency entry points are `onlyGovernance` / `onlyManagers` (4/5 / 2/3 Gnosis Safes); after invocation the protocol team redistributes the recovered assets off-chain. Idle-asset withdrawals respecting outstanding reservations on the *Kaia* side are available via `CooldownVault.recover()` (governance-only). |
+| SUA-53 | CrosschainAdapter | `setBridgeDepositAddress()` overwrites without checking the previous address has zero balance. | Intentional — the bridge deposit address is operated by the bridge service; flexibility is required to swap addresses during bridge incidents. |
+| SUA-55 | RemoteVault | `getUnfulfilledWithdrawalInfo()` returns `unfulfilledWithdrawalAmount` denominated in **USDT** even though `RemoteVault`'s base accounting denominator is USDC. | Intentional — only USDT is crosschain-bridged to Kaia, so the unfulfilled amount must remain in USDT for the keeper to know how much to send. USDC is the canonical denominator everywhere else. |
+| SUA-08 | Strategy | `retrieveDebt` health check executes in vault context (`msg.sender == vault`) with `debtOutstanding=0` and vault-level `totalDebt`. | A separate `GeneralHealthCheck` contract (out of scope) covers the non-strategy evaluation paths. The in-scope health check is intentionally context-bound to the strategy harvest path. |
+| SUA-37 | USDOKycedCA | `_mint` depends on OpenEden's `USDOExpress.instantMint`, which checks both `from`/`to` against OpenEden's KYC list. | Operational — protocol maintains a direct relationship and KYC standing with OpenEden. |
+| SUA-39 | StrategyMorphoV1Vault (legacy) | `adjustPosition()` ignores any pre-existing USDT balance held by the strategy. | Pre-existing balance only arises via external donation, which is out of normal flow. Strategy is also being phased out (and is out of bug-bounty scope). |
+| SUA-46 | UniversalSwapRouter | `setMaxSlippagePercent(uint256)` accepts up to 100% (`BASIS_POINTS = 10_000`). | Slippage protection is treated as a health check, not a hard guarantee — the upper bound is the disable signal for governance. SE-P5 below applies to the same surface. The `UniversalSwapRouter` itself is an out-of-scope helper for this round (kept in-tree only as a compile dep of `RemoteVault`). |
+| SUA-10 | CooldownVault | Missing ERC4626 `Deposit` event emission. | `CooldownVault` is not a strict ERC4626 implementation; it uses `ERC20WrapperUpgradeable` and exposes the ERC4626 *interface* for compatibility only. |
+| SUA-20 | StrategyMorphoV1Vault (legacy) | `liquidateAllPositions()` returns 0 if Morpho lacks underlying liquidity for full redemption (the inner `requestRedeem` reverts and is caught). | Intentional — full liquidation is meant to be handled operationally (debt-ratio reduction, withdrawal-queue tweaks) rather than at the strategy level. |
+| SA2-13 | RemoteVault | `RemoteVault.totalAssets()` does not wrap external `IExternalAssetsProvider.getTotalAssets()` calls in `try/catch`; a reverting provider DoSes accounting. | Intentional — masking provider reverts as zero would silently misvalue the vault. The `try/catch` was deliberately added only to the *setter* so governance can replace a permanently-reverting provider. |
+| SA2-77 | RemoteVault | `_tryProcessBridgeNotification()` requires `totalBalance >= notification.amount` *exactly*. Any bridge-fee deduction (even 1 wei short) leaves the notification "awaiting". | Intentional — a protocol-level buffer absorbs bridge-fee variance, so the exact-equality semantic is correct. |
+| SA2-78 | RemoteVault | `emergencyBridgeAssetsToOrigin()` does not decrement `unfilledWithdrawalAmount`. | Intentional — `unfilledWithdrawalAmount` only accumulates from Kaia-initiated withdrawal requests; the emergency path moves assets without a corresponding request and therefore has nothing to decrement. |
+| SE-P1 | SuperEarnRouter | `depositWithPermit*` calls `IERC20Permit.permit()` directly without `try/catch`. An attacker can extract the permit signature from the public mempool and front-run it, causing the user's deposit transaction to revert with `permit nonce mismatch`. | Intentional — this is the standard ERC-2612 surface. No funds are at risk (the permit only grants approval to the router); the user simply re-submits without the permit leg. Treated as a transient UX issue, not a vulnerability. Re-reports of this pattern are OOS unless they demonstrate a fund-loss path beyond transaction revert. The deposit-side variants currently in code are `depositWithPermit` and `depositWithPermitAndReferral`. |
+| SE-P2 | CooldownVault | Uses `ERC20WrapperUpgradeable` with a 1:1 share-to-asset model and **does not** apply OpenZeppelin's ERC4626 virtual-shares / `_decimalsOffset` defense against first-depositor inflation. | Intentional — `CooldownVault` is gated by `authorizedAddresses` (`onlyAuthorized` on `depositFor`/`withdrawTo`/redemption entries). Only contracts the protocol explicitly authorizes (the `SuperEarnRouter`, the `BaseCooldownStrategy` family, and approved strategies) can mint or burn shares, so the classical first-depositor inflation precondition (an arbitrary attacker depositing first) does not apply. Inflation findings that do not bypass `authorizedAddresses` are OOS. |
+| SE-P3 | RemoteVault | `emergencyRecoverToken()` blocks only `usdc` and `usdt`; any other token sent to the vault can be recovered by `GOVERNANCE_ROLE`. | Intentional — CustomStrategy position tokens (PT/SY/Morpho LP/etc.) are held by the strategy contract, not the vault, so they are not on this surface. The `emergencyRecoverToken` path exists to recover dust or accidentally-sent external tokens. Findings claiming "governance can drain non-vault tokens" are OOS. |
+| SE-P4 | CrosschainAdapter | `receive() external payable {}` accepts ETH from anyone. Used to absorb CCIP fee refunds. | Intentional — refunded ETH is consumed by subsequent CCIP `ccipSend` fees. ETH sent by external callers becomes part of the same fee-pool surface and is non-refundable. Findings claiming "anyone can lock ETH in the adapter" are OOS as long as no protocol invariant breaks. |
+| SE-P5 | UniversalSwapRouter | `setMaxSlippagePercent()` is gated by `onlyGovernance` (4/5 Gnosis Safe), not `onlyManagement`. SUA-46's "100% slippage allowed" applies only to the Governance multisig and is treated as a kill-switch, not an operational control. | Intentional — strengthens SUA-46 by clarifying that the upper bound can only be set by the 4/5 multisig, which is already covered by the governance trust assumption. Re-reports framing this as a `MANAGEMENT_ROLE` rugpull are OOS. |
+| SE-P6 | CooldownVault | `instantRedeem()` is gated by `onlyStrategy`. SUA-13's "predeposit + instantRedeem drains idle liquidity" requires the caller to already be an authorized strategy. | Intentional — combined with SUA-13's "all strategies are internally developed and operated" trust assumption, both `predeposit` and `instantRedeem` are authorized-strategy-only. Variants that frame the same exploit through `instantRedeem` instead of `predeposit` remain OOS unless the caller is unauthorized. |
+| SE-P7 | All upgradeable contracts | All `initialize()` functions are guarded by OpenZeppelin's `initializer` modifier but have **no caller restriction**. | Intentional — every upgradeable contract is deployed atomically with its initialize call (the deployer is the only entity capable of front-running, and the deployment scripts bundle proxy creation + initialization in a single transaction). Re-reports of "anyone can call initialize() on a freshly deployed proxy before the deployer" are OOS for already-deployed contracts; only initialize-front-run on a *new, not-yet-initialized* deployment is in scope. |
+| SE-P8 | Crosschain layer | Chainlink CCIP does not guarantee message ordering across `(srcChain, destChain)` pairs; messages can arrive out-of-order. | Intentional — the protocol's correctness model is *eventual consistency*. Every CCIP envelope carries a full `StateSnapshot { vaultState, bridgeState }`, the `BridgeAccountant` tracks dual pending-nonce streams, and `processPendingBridgeAssets()` reconciles regardless of arrival order. Findings that argue "CCIP messages can be reordered" without demonstrating a double-credit, drain, or permanent freeze are OOS. |
+| SE-P9 | Bridge integrations | Recovery from Rhino service-level failures (delivery never arrives, deposit address compromised) relies on governance-only paths. | Intentional — service-level bridge failures are recovered via `RemoteVault.emergencyBridgeAssetsToOrigin()`, `OriginVault.emergencyRecoverToken()`, and `CrosschainAdapter.setBridgeDepositAddress()` (already covered by SUA-53). The Rhino bridge service is treated as a trusted dependency; permanent service failure is treated as systemic risk and is out of scope. |
+| SE-P10 | All upgradeable contracts | Storage `__gap` sizes differ across contracts (e.g. `BridgeAccountant: 18`, `CooldownVault: 20`, `CustomVault: 43`, `SuperEarnMessageAgent: 49`). | Intentional — gap sizes were sized at the audit baseline relative to the slot count of each contract. Storage layout is verified against the OpenZeppelin upgrade plugin on every upgrade. "The gap is too small" is not a finding by itself; only a *demonstrated* storage collision under a realistic upgrade path is in scope. |
+| SSA-08 | CustomVault | `CustomVault.totalAssets()` aggregates `ICustomStrategy.totalAssets()` from registered strategies in a loop without `try/catch`; a single reverting strategy DoSes vault valuation and downstream paths (e.g. `CustomYearnStrategy.repayPredepositDebt()` shortfall branch). | Intentional — silently treating a temporarily-failing strategy's balance as zero is more dangerous than reverting, because it would silently misvalue the vault during the failure window. The strategy registry's setter path is the recovery surface (governance can remove a permanently-reverting strategy). Mirrors the same rationale as SA2-13 on `RemoteVault.totalAssets()`. |
+
+**B. Surfaces not present in the codebase — DO NOT propose adding them**
+
+| ID | Surface absent from current code | Note |
+| --- | --- | --- |
+| SUA-25, SUA-30 | `callbackHintHash` / `validateRounds` / `createResponseMessage` / `MaxRoundsReached` / `remainingRounds` (Runespear callback / round-limit feature). | Not present in the codebase. Re-proposing this surface re-opens both findings; do not re-flag its absence. |
+| SUA-22 | The "unreachable" branches in `StrategyUSDOExpressV2.premintCooldownVault()` referenced by SUA-22. | Not present in the codebase. Asymmetry between `StrategyUSDOExpressV2` and `StrategyOriginVault` is intentional; do not re-flag it. (Note: `StrategyUSDOExpressV2` is itself out of scope for this round — see "Out of Scope — Contracts" above.) |
+| SUA-12 | `recordOutbound` / `recordSentOperation` (the outbound-queue functions referenced by SUA-12). | Not present in the codebase; the bridge flow uses `initiateBridge` only. Do not re-flag SUA-12 against current code. |
+
+**C. Out-of-scope-by-design**
+
+* **Morpho V1 strategies** (`StrategyMorphoV1Vault` Core / Prime / RWA on Ethereum) — out of scope.
+* **Pendle PT Diamond strategy and its facets / per-asset diamonds (sNUSD / cUSD / cUSDO)** and their swappers (`USDCToSNUSDCurveSwapper`, `USDCToCUSDOSwapper`, `USDTToSUSDeSwapper`, `USDCToSrUSDeSwapper`) — out of scope. The Certik IDs SA2-17 / SA2-33 / SA2-43 / SA2-61 / SA2-62 / SA2-65 / SA2-66 / SA2-69 / SA2-71 / SA2-75 / SA2-80 / SA2-81 and the `PendlePTEmergencyExecutionFacet` trust-assumption disclosure all map to this surface and are not eligible for bounty.
+* **Centralization / "no timelock" findings** (Certik IDs SUA-47, SUA-48, SA2-56, SA2-57, SSA-01, SSA-02) — mitigated operationally by the 4/5 Gnosis Safe (Governance) and 2/3 Gnosis Safe (Management). Re-reports framed as "owner can rug", "no timelock", or "ProxyAdmin can upgrade" are out of scope.
+* **Strategy Audit IDs covered by Certik 2026-04-28 (Resolved)** — SSA-03, SSA-04, SSA-05, SSA-06, SSA-07, SSA-09, SSA-10, SSA-11, SSA-12, SSA-13, SSA-14, SSA-15, SSA-16, SSA-17, SSA-18. The current codebase reflects the post-resolution state; re-reports against the current code mapping to any of these IDs are OOS unless the report demonstrates a *materially different* exploit path.
+
+If you find a vulnerability in any of the above areas that is **materially different** from any of the listed Certik IDs (different exploit path, different invariant violated, different impact), please describe the difference clearly in your submission — it may still qualify.
+
+### **Trust Assumptions**
+
+The following are assumed to behave correctly and are out of scope:
+
+* **Governance / Management / Revenue multisigs** are trusted not to act maliciously. The protocol uses a 4/5 Gnosis Safe for `GOVERNANCE_ROLE` (Kaia: `0x694B81Db...d5f05`, Ethereum: `0xce6917FF...897f2f`) and a 2/3 Gnosis Safe for `MANAGEMENT_ROLE`, with `ProxyAdmin` ownership held by the Governance Safe on both chains. **The protocol does not currently use an on-chain timelock on top of the multisig** — this trade-off is documented and acknowledged in prior audits. A finding that requires the multisig to behave adversarially, or that only argues "no timelock", is out of scope.
+* **Keepers (`LightKeeper`, `CrosschainKeeper`)** are trusted to call the operations they are authorized for in a timely manner. A finding that requires a malicious keeper to drain a strategy through an authorized path is out of scope (a finding where an unauthorized address can call a keeper-only function is in scope).
+* **Strategists** are trusted within the bounded execution allowlist of `CustomStrategy`. A finding that requires the strategist to act maliciously within the allowlist is out of scope; a finding that lets the strategist escape the allowlist or `assetsChangeTolerance` is in scope.
+* **All strategies are internally developed and operated.** Findings that assume an externally-controlled or malicious strategy contract (e.g., a rogue strategy abusing `predeposit()`/`instantRedeem()` to drain `CooldownVault` idle liquidity) are out of scope. New external strategies will undergo separate review before being authorized.
+* **Yearn V2 `Vault.vy` and `Registry.vy`** are trusted and unmodified.
+* **External protocols** (Morpho, Pendle, OpenEden, Ethena, Neutrl, Cap, Fluid, Curve, Uniswap, CCIP, Orakl, Rhino) are trusted within their documented behaviour.
+* **Stablecoin issuers** (USDT, USDC, USDO) are trusted; permanent depeg is out of scope.
+* **OpenEden KYC dependency**: `USDOKycedCA` calls into OpenEden's `USDOExpress.instantMint`, which requires the protocol's address to remain on OpenEden's KYC allowlist. Findings that hinge on OpenEden delisting the protocol's address are out of scope.
+* **Permissioned entry-points** on `OriginVault` (whitelist), `CooldownVault` (`authorizedAddresses`), and the role-based gates on `RemoteVault` are intentional. Bypassing them is in scope; abusing them as an authorized entity is generally out of scope unless the abuse circumvents an additional invariant.
+
+---
+
+## **Safe Harbor**
+
+SuperEarn supports good-faith security research. Activities conducted in compliance with this program are treated as authorized; SuperEarn will not pursue, support, or encourage legal action against a researcher for security research that:
+
+* Stays within the in-scope contract list and program rules above
+* Reproduces the finding on a fork / local devnet rather than against the live protocol beyond the minimum needed to demonstrate it
+* Does not access, modify, or move user funds, off-chain systems, or another user's positions
+* Reports the issue privately and exclusively through the program's designated submission channel within 24 hours of discovery
+* Avoids degrading service availability and respects user privacy
+
+Specifically, when these conditions are met:
+
+* SuperEarn will not initiate civil action and will not pursue claims under the U.S. Computer Fraud and Abuse Act (CFAA), Digital Millennium Copyright Act (DMCA), or analogous computer-misuse / unauthorized-access statutes in other jurisdictions for the in-scope research activity itself.
+* If a third party (e.g. an external infrastructure provider) initiates legal action against a researcher who has acted in good faith under this program, SuperEarn will make a good-faith effort to clarify that the activity was authorized.
+
+This safe harbor:
+
+* Covers only conduct directly governed by this program. It does **not** authorize violation of any other law, contract, or third-party right unrelated to security research conducted under this program.
+* Does **not** cover exploitation beyond the minimum needed to demonstrate impact, theft or movement of user funds, public disclosure prior to remediation, or interaction with off-chain components and external protocols listed as out of scope.
+* Does **not** override applicable sanctions law. Researchers in jurisdictions subject to comprehensive U.S./EU/UN sanctions are not eligible to participate.
+
+If you are unsure whether a planned action is covered, ask via the designated submission channel **before** taking the action. SuperEarn will treat such pre-clearance requests confidentially.
+
+---
+
+## **Program Rules**
+
+* Make every effort not to damage or restrict the availability of the protocol's mainnet contracts, RPC endpoints, or related infrastructure. Reproduce findings on a fork (Foundry / Hardhat) or local devnet first
+* Do not exploit a discovered vulnerability against the live protocol beyond the minimum necessary to demonstrate the issue
+* Do not move user funds, do not interact with another user's positions, and localize all on-chain testing to your own addresses
+* Do not perform DoS / DDoS, social engineering, phishing, or spam
+* Do not access or modify off-chain systems (RPC, indexer, frontend, keeper bots) — these are out of scope and out-of-scope interactions void the bounty
+* Perform testing only within the in-scope contract list
+* If you find chained vulnerabilities, only the highest-severity vulnerability in the chain will be paid
+* Do not break any law and stay within the defined scope
+* Vulnerability details must not be communicated to anyone outside of the program team without prior written consent
+
+---
+
+## **Disclosure Guidelines**
+
+* Do not discuss this program or any vulnerabilities (even resolved ones) outside of the program without express consent from the SuperEarn team
+* No vulnerability disclosure, including partial disclosure, is permitted while the report is open
+* Do not publish, blog, tweet, or discuss findings publicly until the SuperEarn team has confirmed remediation and approved disclosure
+
+---
+
+## **Eligibility and Coordinated Disclosure**
+
+* You must be the first reporter of a given vulnerability
+* The vulnerability must be a qualifying vulnerability per the scope and severity classification above
+* Any vulnerability found must be reported no later than 24 hours after discovery and exclusively through the bug-bounty platform / channel designated for this program
+* Submit a clear textual description of the report along with steps to reproduce, attachments such as screenshots, and a runnable proof-of-concept (Foundry test, script, or similar) where applicable
+* You must not be a current or former employee, contractor, or auditor of SuperEarn or its affiliates
+* Use ONLY the email under which you registered your bug-bounty account; mismatched identities void the bounty
+* Provide detailed but to-the-point reproduction steps; the SuperEarn team must be able to reproduce the issue independently
+* AI-generated reports without a runnable PoC will not be accepted under this program

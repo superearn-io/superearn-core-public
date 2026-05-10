@@ -1,0 +1,28 @@
+{
+  "name": "superearn-core",
+  "description": "SuperEarn protocol — public source release for the SuperEarn Bug Bounty Program",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@bisonai/orakl-contracts": "^2.0.2",
+    "@chainlink/contracts": "^1.4.0",
+    "@chainlink/contracts-ccip": "^1.6.1",
+    "@openzeppelin/contracts": "5.3.0",
+    "@openzeppelin/contracts-upgradeable-4.9.4": "npm:@openzeppelin/contracts-upgradeable@4.9.4",
+    "@uniswap/v3-periphery": "^1.4.4",
+    "@uniswap/v4-core": "^1.0.2",
+    "@uniswap/v4-periphery": "^1.0.3"
+  },
+  "devDependencies": {
+    "forge-std": "github:foundry-rs/forge-std#v1.9.7",
+    "prettier": "^3.5",
+    "solhint": "^5.1"
+  },
+  "scripts": {
+    "build": "forge build",
+    "lint:sol": "forge fmt --check && solhint \"src/**/*.sol\"",
+    "prettier:check": "prettier --check \"**/*.{json,md,yml}\"",
+    "prettier:write": "prettier --write \"**/*.{json,md,yml}\""
+  }
+}
