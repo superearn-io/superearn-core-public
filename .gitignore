@@ -26,3 +26,6 @@ package-lock.json
 
 # Local LLM workspace files (private)
 CLAUDE.md
+
+# Files with the `.ignore.` infix are local-only (review drafts, internal notes, etc.)
+*.ignore.*

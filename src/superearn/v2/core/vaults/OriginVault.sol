@@ -220,7 +220,6 @@ contract OriginVault is
         // Grant GOVERNANCE_ROLE to owner
         _grantRole(GOVERNANCE_ROLE, _owner);
 
-        // Whitelist owner by default for emergency operations and initial setup
         _pause();
     }
 

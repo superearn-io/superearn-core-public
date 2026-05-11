@@ -19,7 +19,7 @@ struct StrategyParams {
 /**
  * @title IVault
  * @notice Interface for Yearn Vault contract
- * @dev This interface corresponds to Vault.vy version 0.3.3
+ * @dev This interface corresponds to Vault.vy version 0.4.6 (the `apiVersion()` reported by the in-scope deployed Yearn V2 vaults)
  */
 interface IVault is IERC20 {
     // Vault Events

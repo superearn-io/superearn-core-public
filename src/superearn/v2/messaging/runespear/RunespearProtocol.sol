@@ -106,6 +106,6 @@ library RunespearProtocol {
     // @notice State synchronization with no expectation for acknowledgement (mostly for state synchronization)
     bytes4 public constant SYNC_NOOP = bytes4(keccak256(abi.encodePacked("sync()", VERSION_SALT)));
 
-    /// @notice Notification that bridge was initiated (sent from source to destination) - TO DEPRECATE
+    /// @notice Notification that bridge was initiated (sent from source to destination).
     bytes4 public constant SYNC_BRIDGED = bytes4(keccak256(abi.encodePacked("bridgeSent(Bridged)", VERSION_SALT)));
 }

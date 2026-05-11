@@ -36,7 +36,7 @@ Most listed contracts are upgradeable TransparentUpgradeableProxy instances with
 
 > The Ethereum-side stack downstream of `RemoteVault` is **out of scope** for this bounty round, and the table below lists only the bridge-receiving and crosschain-messaging contracts that remain in scope. Two distinct OOS reasons apply:
 > - **Unfunded Yearn-attached path:** `SuperEarnRouter`, `CooldownVault` (USDC/USDT), `YearnVaultManager` (USDC/USDT), `StrategyMorphoV2Vault`. Capital is not currently routed through this pipeline.
-> - **Funded but external-yield-bounded:** the three `CustomStrategy` deployments (USDC Multi-Morpho, USDT Multi-Morpho, Pendle PT-USDG) — registered directly with `RemoteVault` and currently holding funds, but excluded as external-yield strategies bounded by strategist trust assumptions.
+> - **Funded but external-yield-bounded:** the live `CustomStrategy` deployments registered directly with `RemoteVault` (Multi-Morpho, Pendle, etc.; the exact set rotates operationally) — currently holding funds, but excluded as external-yield strategies bounded by strategist trust assumptions.
 > - `USDOKycedCA` (Ethereum) is also OOS for this round.
 
 | Contract | Address | Bounty Tier |
@@ -67,7 +67,7 @@ Most listed contracts are upgradeable TransparentUpgradeableProxy instances with
 
 The implementation contract behind each in-scope proxy as of the most recent upgrade, verified against the EIP-1967 implementation slot on each proxy. The `ProxyAdmin` of every proxy on each chain has been verified to be the single chain-wide admin listed at the top of each table; that admin in turn is owned by the Governance Gnosis Safe (4-of-5).
 
-**Snapshot date:** `2026-05-07` (verified via `cast storage`)
+**Snapshot date:** `2026-05-11` (verified via `cast storage`; no in-scope implementation upgrades between this date and the 2026-05-07 initial cast pass)
 
 ### Kaia Mainnet — Implementations
 
