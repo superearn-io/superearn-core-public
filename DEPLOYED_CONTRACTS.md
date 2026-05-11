@@ -1,6 +1,6 @@
 # SuperEarn — In-Scope Deployed Contracts
 
-This file lists every contract that is **in scope** for the [SuperEarn Bug Bounty Program](./BUG_BOUNTY.md). Out-of-scope deployed contracts (off-vault helpers, the Ethereum Yearn-attached path, the funded but external-yield-bounded Ethereum `CustomStrategy` deployments, `StrategyMorphoV1Vault`, Pendle PT Diamond and its facets / swappers, Yearn V2 Vyper vaults, external protocols, off-chain components) are intentionally not listed here — see [BUG_BOUNTY.md → Out of Scope — Contracts](./BUG_BOUNTY.md) for the full list and rationale.
+This file lists every contract that is **in scope** for the [SuperEarn Bug Bounty Program](./BUG_BOUNTY.md). Out-of-scope deployed contracts (the user-facing `SuperEarnRouter` on Kaia, off-vault helpers, the Ethereum Yearn-attached path, the funded but external-yield-bounded Ethereum `CustomStrategy` deployments, `StrategyMorphoV1Vault`, Pendle PT Diamond and its facets / swappers, Yearn V2 Vyper vaults, external protocols, off-chain components) are intentionally not listed here — see [BUG_BOUNTY.md → Out of Scope — Contracts](./BUG_BOUNTY.md) for the full list and rationale.
 
 Most listed contracts are upgradeable TransparentUpgradeableProxy instances with `ProxyAdmin` ownership held by the Governance Gnosis Safe on each chain. The two **non-proxy** in-scope contracts on Kaia — `StrategyOriginVault` and `CustomYearnStrategy` — are Yearn V2 strategies deployed as plain (non-upgradeable) contracts; replacement happens by deploying a new strategy and re-binding it through the Yearn vault's strategy management surface.
 
@@ -24,7 +24,6 @@ Most listed contracts are upgradeable TransparentUpgradeableProxy instances with
 | CrosschainAdapter | [`0x8E53CdAa89381c203a074fB3388f65936358f200`](https://kaiascan.io/address/0x8E53CdAa89381c203a074fB3388f65936358f200) | Critical |
 | SuperEarnMessageAgent | [`0xd8acFF2E2B8B1Cf052aca4Ba331743F73C569E68`](https://kaiascan.io/address/0xd8acFF2E2B8B1Cf052aca4Ba331743F73C569E68) | Critical |
 | CooldownVault | [`0x4E4654cE4Ca7ff0ba66a0A4a588A4bd55A6f9A33`](https://kaiascan.io/address/0x4E4654cE4Ca7ff0ba66a0A4a588A4bd55A6f9A33) | Critical |
-| SuperEarnRouter | [`0x7437892A3e2E658038758dD7CA638334C0c2006C`](https://kaiascan.io/address/0x7437892A3e2E658038758dD7CA638334C0c2006C) | High |
 | StrategyOriginVault | [`0x650a4c074a58B18fbEEd48ae766e58a382D9E5F5`](https://kaiascan.io/address/0x650a4c074a58B18fbEEd48ae766e58a382D9E5F5) | Critical |
 | CustomYearnStrategy | [`0x723d3422788f47f5DaE153515A3C277293dbd8f3`](https://kaiascan.io/address/0x723d3422788f47f5DaE153515A3C277293dbd8f3) | Critical |
 | CustomVault | [`0x7876a2faf6Aad1F6F8E47AD612D9472a4821DfDa`](https://kaiascan.io/address/0x7876a2faf6Aad1F6F8E47AD612D9472a4821DfDa) | Critical |
@@ -80,7 +79,6 @@ The implementation contract behind each in-scope proxy as of the most recent upg
 | CrosschainAdapter | [`0xdE597fB7Ee1De45fFe80881a4Ce2259f67CBd610`](https://kaiascan.io/address/0xdE597fB7Ee1De45fFe80881a4Ce2259f67CBd610) |
 | SuperEarnMessageAgent | [`0x0f554fF1C806b9bbacEf88462e21d685e5D39c96`](https://kaiascan.io/address/0x0f554fF1C806b9bbacEf88462e21d685e5D39c96) |
 | CooldownVault | [`0x570435b7ABCc8241Cfdbcbf05Ba960218acCd190`](https://kaiascan.io/address/0x570435b7ABCc8241Cfdbcbf05Ba960218acCd190) |
-| SuperEarnRouter | [`0xA7E483Ec8696Cd2738c7d26927e13A778355B287`](https://kaiascan.io/address/0xA7E483Ec8696Cd2738c7d26927e13A778355B287) |
 | CustomVault | [`0x90a2b553845bdc0f4c43554ed306d09fb632f259`](https://kaiascan.io/address/0x90a2b553845bdc0f4c43554ed306d09fb632f259) |
 | USDOKycedCA | [`0x12f50Cd71164E84fB0D87984FDd6aD9009E41Ff0`](https://kaiascan.io/address/0x12f50Cd71164E84fB0D87984FDd6aD9009E41Ff0) |
 
