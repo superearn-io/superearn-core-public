@@ -38,10 +38,12 @@ contract SuperEarnRouter is Initializable, ISuperEarnRouter, MulticallUpgradeabl
     error RedeemBlocked(address yVault);
     error RedeemWindowClosed(address yVault, uint64 deadline);
     error DepositorNotWhitelisted(address yVault, address depositor);
+    error RedeemDebtLimitExceeded(address yVault, uint256 totalDebt, uint256 limit);
 
     // === Events ===
     event DepositorWhitelistEnforcementSet(address indexed yVault, bool enforced);
     event DepositorWhitelisted(address indexed yVault, address indexed depositor, bool allowed);
+    event RedeemTotalDebtLimitSet(address indexed yVault, uint256 limit);
 
     // === State Variables ===
 
@@ -59,6 +61,12 @@ contract SuperEarnRouter is Initializable, ISuperEarnRouter, MulticallUpgradeabl
     /// @notice Per-yVault depositor whitelist. Only consulted when
     ///         `depositorWhitelistEnforced[yVault]` is true.
     mapping(address yVault => mapping(address depositor => bool)) public yVaultDepositorWhitelist;
+
+    /// @notice Per-yVault cap on the linked CooldownVault's `totalDebt`, enforced at the END of a
+    ///         redeem. A redeem reverts when the CooldownVault's `totalDebt` exceeds this value after
+    ///         the redemption request has been created. Denominated in the CooldownVault's underlying
+    ///         asset units (e.g. 6-decimal USDC/USDT). 0 = no cap (check disabled; default).
+    mapping(address yVault => uint256 maxTotalDebt) public maxRedeemTotalDebt;
 
     // === Initializer ===
 
@@ -412,6 +420,19 @@ contract SuperEarnRouter is Initializable, ISuperEarnRouter, MulticallUpgradeabl
             IERC20(yVault).safeTransfer(msg.sender, remainingShares);
         }
 
+        // Cap the CooldownVault's outstanding redemption debt. The redeem above (via the Yearn
+        // withdraw → strategy liquidation → predeposit path) may have grown the CooldownVault's
+        // `totalDebt`; if a per-yVault limit is configured and the resulting `totalDebt` exceeds it,
+        // revert so a single redeem cannot push promised-future-asset debt past a safe threshold.
+        // A 0 limit means the cap is disabled (default), leaving existing vaults unaffected.
+        uint256 debtLimit = maxRedeemTotalDebt[yVault];
+        if (debtLimit != 0) {
+            uint256 currentTotalDebt = cooldownVault.totalDebt();
+            if (currentTotalDebt > debtLimit) {
+                revert RedeemDebtLimitExceeded(yVault, currentTotalDebt, debtLimit);
+            }
+        }
+
         emit Redeemed(msg.sender, receiver, yVault, yShares, filledShares, requestId, assets);
     }
 
@@ -598,6 +619,63 @@ contract SuperEarnRouter is Initializable, ISuperEarnRouter, MulticallUpgradeabl
             MathUpgradeable.mulDiv(cooldownSharesNeeded, 10 ** decimals, pricePerShare, MathUpgradeable.Rounding.Up);
     }
 
+    /**
+     * @notice Maximum yVault shares that can be redeemed through this router in a single redeem()
+     *         without tripping the per-yVault CooldownVault `totalDebt` cap (`maxRedeemTotalDebt`).
+     * @dev Returns the largest `yShares` for which a redeem() is expected to satisfy the
+     *      end-of-redeem check `cooldownVault.totalDebt() <= maxRedeemTotalDebt[yVault]`.
+     *
+     *      Model: redeeming `yShares` withdraws
+     *          cooldownShares = yShares * pricePerShare / 10**decimals
+     *      worth of CooldownVault shares. In the worst case the strategy must `predeposit()` that
+     *      entire amount, growing `totalDebt` by up to that many underlying assets (the CooldownVault
+     *      keeps a 1:1 share:asset ratio). The remaining room under the cap is
+     *      `headroom = limit - currentTotalDebt`, so the bound is:
+     *          maxShares = floor( convertToShares(headroom) * 10**decimals / pricePerShare )
+     *
+     *      The conversions round DOWN (floor) on purpose: the result UNDER-estimates the redeemable
+     *      shares so that passing the returned value straight into redeem() keeps `totalDebt` at or
+     *      below the cap and does NOT revert with `RedeemDebtLimitExceeded`.
+     *
+     *      Special cases:
+     *        - limit == 0 (cap disabled)   -> type(uint256).max (this check imposes no restriction)
+     *        - currentTotalDebt >= limit   -> 0 (no room left under the cap)
+     *
+     *      ⚠️ OFF-CHAIN USAGE: this is a point-in-time snapshot computed from the CURRENT
+     *      `pricePerShare` and `totalDebt`. A yVault's `pricePerShare` generally rises block-by-block
+     *      as strategies accrue/harvest yield, and `totalDebt` can also move between the moment you
+     *      read this value and the moment your redeem() actually lands. A higher `pricePerShare` maps
+     *      the SAME yShares to MORE CooldownVault shares (hence more debt), so using the returned
+     *      amount too tightly can still make redeem() revert. Off-chain consumers MUST leave a safety
+     *      buffer (e.g. use ~95-99% of the returned value, or re-quote immediately before submitting)
+     *      rather than redeeming the exact amount. Note this view also ignores the deposit/redeem
+     *      lockups and whitelist gating — those are enforced separately inside redeem().
+     * @param yVault Address of the Yearn vault
+     * @return maxShares Maximum yVault shares redeemable under the totalDebt cap (floored)
+     */
+    function maxRedeemableShares(address yVault) external view returns (uint256 maxShares) {
+        uint256 limit = maxRedeemTotalDebt[yVault];
+        // 0 means the cap is disabled, so this check imposes no upper bound.
+        if (limit == 0) return type(uint256).max;
+
+        ICooldownVault cooldownVault = ICooldownVault(IVault(yVault).token());
+        uint256 currentTotalDebt = cooldownVault.totalDebt();
+        // Already at or above the cap: no further redeem is allowed.
+        if (currentTotalDebt >= limit) return 0;
+
+        uint256 headroom = limit - currentTotalDebt;
+
+        uint256 pricePerShare = IVault(yVault).pricePerShare();
+        if (pricePerShare == 0) revert InvalidPrice();
+        uint256 decimals = IVault(yVault).decimals();
+
+        // headroom (underlying assets) -> CooldownVault shares (round DOWN), then -> yVault shares
+        // (round DOWN). Both floors keep the implied debt at/below `headroom`.
+        uint256 maxCooldownShares = cooldownVault.convertToShares(headroom);
+        maxShares =
+            MathUpgradeable.mulDiv(maxCooldownShares, 10 ** decimals, pricePerShare, MathUpgradeable.Rounding.Down);
+    }
+
     function setRemoteVault(address _remoteVault) external onlyOwner {
         remoteVault = _remoteVault;
         emit RemoteVaultSet(_remoteVault);
@@ -654,14 +732,7 @@ contract SuperEarnRouter is Initializable, ISuperEarnRouter, MulticallUpgradeabl
      * @param depositors Addresses to add or remove
      * @param allowed True to allow, false to revoke
      */
-    function setDepositorsWhitelisted(
-        address yVault,
-        address[] calldata depositors,
-        bool allowed
-    )
-        external
-        onlyOwner
-    {
+    function setDepositorsWhitelisted(address yVault, address[] calldata depositors, bool allowed) external onlyOwner {
         uint256 len = depositors.length;
         for (uint256 i = 0; i < len;) {
             yVaultDepositorWhitelist[yVault][depositors[i]] = allowed;
@@ -710,6 +781,21 @@ contract SuperEarnRouter is Initializable, ISuperEarnRouter, MulticallUpgradeabl
     }
 
     /**
+     * @notice Configure the maximum CooldownVault `totalDebt` permitted at the end of a redeem
+     *         for a given yVault.
+     * @dev When set to a non-zero value, any redeem() through the router that leaves the linked
+     *      CooldownVault's `totalDebt` above `limit` reverts with `RedeemDebtLimitExceeded`. Set to 0
+     *      to disable the cap (default). `limit` is denominated in the CooldownVault's underlying
+     *      asset units (e.g. 6-decimal USDC/USDT).
+     * @param yVault Address of the Yearn vault
+     * @param limit Maximum allowed CooldownVault.totalDebt after a redeem (0 = no cap)
+     */
+    function setMaxRedeemTotalDebt(address yVault, uint256 limit) external onlyOwner {
+        maxRedeemTotalDebt[yVault] = limit;
+        emit RedeemTotalDebtLimitSet(yVault, limit);
+    }
+
+    /**
      * @notice Preview the claimability and maximum assets for a redemption request
      * @dev Returns whether the cooldown period has passed and the maximum claimable amount
      *      considering the vault's current asset balance
@@ -736,12 +822,23 @@ contract SuperEarnRouter is Initializable, ISuperEarnRouter, MulticallUpgradeabl
     }
 
     /**
-     * @dev This empty reserved space is put in place to allow future versions to add new
-     * variables without shifting down storage in the inheritance chain.
-     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     * @dev Reserved storage gap so future versions can append variables without
+     * shifting inherited storage. See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
      *
-     * Storage usage: 4 slots (registry, remoteVault, whitelistedVaults, vaultLockups)
-     * Gap = 50 - 4 = 46
+     * Own storage: 7 slots, in declaration order (each appended in a later version and
+     * never reordered, so every deployed slot is fixed):
+     *   registry, remoteVault, whitelistedVaults, vaultLockups,
+     *   depositorWhitelistEnforced, yVaultDepositorWhitelist, maxRedeemTotalDebt
+     *
+     * Block = 7 vars + 43 gap = 50 slots (standard convention). SuperEarnRouter is the
+     * most-derived (leaf) contract, so the gap is pure trailing reserve: normalizing it to
+     * 43 only shrinks the empty tail and moves NO live data — the 7 variables keep their
+     * slots (151..157) and nothing inherits after this gap. (This is safe ONLY because it
+     * is a leaf; never resize the gap of an inherited/base contract on a deployed proxy.)
+     *
+     * To add a variable: append it after maxRedeemTotalDebt and decrement the gap
+     * (-> `uint256[42]`). Never reorder/insert/remove an existing variable.
+     * See CLAUDE.md "Storage Gap (`__gap`) Convention".
      */
-    uint256[46] private __gap;
+    uint256[43] private __gap;
 }

@@ -596,10 +596,10 @@ contract CooldownVault is
             return ("INVALID", 0);
         }
 
-        // Check cooldown period
-        if (block.timestamp < request.cooldownRequestedTime + request.cooldownPeriod) {
-            return ("SHOULD_WAIT", 0);
-        }
+        // NOTE: The cooldown is intentionally NOT checked here up-front. It is enforced further
+        // below ONLY when this request cannot already be paid in full from available liquidity —
+        // see the "Cooldown gate with liquidity bypass" block. This lets a fully-funded request be
+        // claimed immediately, even before its cooldown elapses.
 
         // Sum of all requests before this one (requests 1 to requestId-1)
         uint256 _accRedeemRequestedAmount = accRedeemRequestedAmount[requestId - 1];
@@ -624,11 +624,45 @@ contract CooldownVault is
 
         // Calculate claimable based on available unreserved liquidity
         assetsOut = MathUpgradeable.min(request.assets, availableLiquidity);
+
+        // Cooldown gate with liquidity bypass.
+        //
+        // The cooldown exists to give strategies time to liquidate external positions so a
+        // redemption can be funded. When this request can ALREADY be paid IN FULL out of the vault's
+        // unreserved liquidity (`assetsOut == request.assets`, i.e. `_managedAssets` covers every
+        // earlier unclaimed request PLUS this one), that wait is unnecessary, so the claim is allowed
+        // even before the cooldown elapses (immediate claim when liquidity is available).
+        //
+        // Otherwise (the request is not fully funded yet) the cooldown is still enforced and the
+        // caller must wait. Because the bypass only triggers when `reservedForPriorRequests` is fully
+        // covered, an early claim can never consume liquidity reserved for an earlier request, so
+        // FIFO fairness is preserved.
+        //
+        // NOTE: by design this weakens the "everyone waits the cooldown" guarantee — whenever the
+        // vault is liquid enough, holders can exit immediately. This is the intended behaviour.
+        if (block.timestamp < request.cooldownRequestedTime + request.cooldownPeriod && assetsOut < request.assets) {
+            return ("SHOULD_WAIT", 0);
+        }
+
+        // FIFO reservation must hold regardless of the caller's loss tolerance.
+        //
+        // Closing a request always credits the FULL requested amount (accClaimedAmount += request.assets),
+        // which shrinks `reservedForPriorRequests` for every earlier request. So whenever a live
+        // reservation exists for earlier requests and this one cannot be paid in full out of the
+        // unreserved liquidity (assetsOut < request.assets), closing it here would over-credit
+        // accClaimedAmount and let a later claimant overtake an earlier one — block it. This is
+        // independent of the caller's minAssetsOut tolerance.
+        //
+        // The predicate must NOT be narrowed by `request.assets <= _managedAssets`: a genuine shortfall
+        // whose requested size merely EXCEEDS _managedAssets is NOT exempt. Otherwise it would be closed
+        // for a (near-)zero payout while still crediting the full request.assets, erasing the earlier
+        // reservation. A loss-accepting holder can still close once earlier requests clear and the
+        // reservation drops to zero.
+        if (reservedForPriorRequests > 0 && assetsOut < request.assets) {
+            return ("INSUFFICIENT_ASSETS", 0);
+        }
+
         if (assetsOut < minAssetsOut) {
-            // Prior reservations prevent fulfilling this request
-            if (reservedForPriorRequests > 0 && request.assets <= _managedAssets) {
-                return ("INSUFFICIENT_ASSETS", 0);
-            }
             return ("EXCESSIVE_LOSS", assetsOut);
         }
 
@@ -903,6 +937,59 @@ contract CooldownVault is
         _increaseManagedAssetsChecked(assets);
 
         emit StrategyDebtRepaid(strategy, assets, strategyShortfall[strategy]);
+    }
+
+    /**
+     * @notice Escape hatch: declare a backed predeposit unrecoverable through the normal retrieveDebt
+     *         path and convert its full requested amount into a strategy shortfall.
+     * @dev    Used by `StrategyOriginVault.emergencyClearRedemptions` (and any equivalent stuck-state
+     *         recovery flow) when the external vault settlement path is broken and `retrieveDebt`
+     *         cannot succeed. Effects:
+     *           - marks `predepositRequest.claimed = true` so subsequent retrieveDebt calls revert
+     *             cleanly with `DebtAlreadyRepaid` (instead of underflowing in the strategy);
+     *           - reduces `strategyDebtOutstanding[strategy]` by the full debt amount;
+     *           - moves the full debt into `strategyShortfall[strategy]` / `totalShortfall`;
+     *           - leaves `totalDebt` unchanged — it is reduced later when the shortfall is paid back
+     *             via `retrieveShortfall`, which is the ONLY sanctioned path because it ties
+     *             totalDebt reduction to a real underlying transfer (preserving the vault's 1:1
+     *             share-to-asset invariant). If recovery never materialises, the shortfall remains
+     *             on-book and strategy migration stays guarded — that is the protocol's intended
+     *             behaviour for permanent loss; deliberately do NOT add a no-asset write-off path,
+     *             which would break the 1:1 invariant.
+     *         Only the linked strategy (the one that originally created the predeposit) may call.
+     * @param  predepositId Identifier of the backed predeposit being declared unrecoverable.
+     * @return debtAmount   The full `debtAssets` of the predeposit, now moved into shortfall.
+     */
+    function writeOffPredepositDebt(uint256 predepositId)
+        external
+        override
+        whenNotPaused
+        nonReentrant
+        returns (uint256 debtAmount)
+    {
+        PredepositRequest storage predepositRequest = predepositRequests[predepositId];
+        address strategy = predepositRequest.strategy;
+        if (strategy == address(0)) revert InvalidPredepositId();
+        if (_msgSender() != strategy) revert OnlyStrategy();
+        if (predepositRequest.claimed) revert DebtAlreadyRepaid();
+
+        debtAmount = predepositRequest.debtAssets;
+
+        predepositRequest.claimed = true;
+        _unclaimedPredepositRequestIds.remove(predepositId);
+
+        // Move the full debt from "predeposit outstanding" into "shortfall outstanding".
+        // totalDebt is intentionally NOT decreased here: it stays until the shortfall is
+        // either repaid (retrieveShortfall) or absorbed (absorbStrategyShortfall).
+        uint256 currentOutstanding = strategyDebtOutstanding[strategy];
+        if (debtAmount >= currentOutstanding) {
+            strategyDebtOutstanding[strategy] = 0;
+        } else {
+            strategyDebtOutstanding[strategy] = currentOutstanding - debtAmount;
+        }
+        _increaseShortfall(strategy, debtAmount);
+
+        emit PredepositDebtWrittenOff(strategy, predepositId, debtAmount);
     }
 
     // ============================================

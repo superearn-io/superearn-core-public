@@ -59,6 +59,7 @@ interface ICooldownVault is IERC4626Upgradeable {
     event HealthCheckUpdated(address indexed oldHealthCheck, address indexed newHealthCheck);
     event StrategyDebtShortfall(address indexed strategy, uint256 indexed predepositId, uint256 shortfall);
     event StrategyDebtRepaid(address indexed strategy, uint256 repay, uint256 remainingShortfall);
+    event PredepositDebtWrittenOff(address indexed strategy, uint256 indexed predepositId, uint256 debtAmount);
     event AuthorizedAddressAdded(address indexed authorizedAddress);
     event AuthorizedAddressRemoved(address indexed authorizedAddress);
     event RedeemReceiverUpdated(uint256 indexed requestId, address indexed oldReceiver, address indexed newReceiver);
@@ -101,6 +102,13 @@ interface ICooldownVault is IERC4626Upgradeable {
     function predeposit(uint256 assets) external returns (uint256 predepositId, uint256 shares);
     function retrieveDebt(uint256 predepositId) external;
     function retrieveShortfall(uint256 assets) external;
+    /// @notice Strategy-callable escape hatch: declare a backed predeposit unrecoverable through the
+    ///         normal `retrieveDebt` path. Marks the predeposit claimed and moves the full debtAssets
+    ///         into strategyShortfall (totalDebt unchanged). totalDebt is reduced later ONLY when
+    ///         `retrieveShortfall` is called with real underlying assets — there is intentionally no
+    ///         no-asset write-off path because that would break the vault's 1:1 share-to-asset
+    ///         invariant. Only the linked strategy may call.
+    function writeOffPredepositDebt(uint256 predepositId) external returns (uint256 debtAmount);
 
     // Governance and management
     function cooldownPeriod() external view returns (uint256 period);

@@ -929,7 +929,7 @@ contract UniversalSwapRouter is Initializable, IUnlockCallback, SuperEarnAccessC
     /**
      * @dev Storage gap for upgradeability
      *
-     * Storage usage: 12 slots
+     * Storage usage: 11 slots (slots 201..211, one slot each, no packing):
      *   - swapRouter: 1 slot
      *   - poolManager: 1 slot
      *   - quoterV2: 1 slot
@@ -941,7 +941,8 @@ contract UniversalSwapRouter is Initializable, IUnlockCallback, SuperEarnAccessC
      *   - curvePoolForPair (mapping pointer): 1 slot
      *   - curveTokenIndices (mapping pointer): 1 slot
      *   - uniswapPoolConfigs (mapping pointer): 1 slot
-     * Gap = 50 - 12 = 38
+     * Block = 11 own + 39 gap = 50. UniversalSwapRouter is a leaf (nothing inherits it), so
+     * this trailing gap is pure reserve. Gap = 50 - 11 = 39
      */
-    uint256[38] private __gap;
+    uint256[39] private __gap;
 }

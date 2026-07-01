@@ -267,15 +267,21 @@ abstract contract RunespearSender is Initializable {
     }
 
     /**
-     * Storage usage: 6 slots
+     * Storage usage: 7 slots
      *   - ccipRouter
      *   - feeToken
      *   - chainConfigs mapping pointer
      *   - sentMessages mapping pointer
      *   - defaultGasLimit
      *   - nonce
+     *   - lastCCIPFee (declared mid-file near `_sendCCIPMessage`; still consumes one slot)
      *
-     * Gap = 50 - 6 = 44
+     * This block occupies 51 slots (7 variables + 44 gap), one more than the usual
+     * 50-slot reservation. `__gap` is intentionally FROZEN at 44 and MUST NOT be
+     * reduced to 43: the contracts are already deployed behind proxies, and shrinking
+     * the gap would shift every downstream inherited variable (and CrosschainAdapter's
+     * own state) by one slot on live storage. Any NEW RunespearSender variable must be
+     * added by subtracting from this 44-slot gap (e.g. add a var -> `__gap[43]`).
      */
     uint256[44] private __gap;
 }

@@ -33,6 +33,9 @@ contract StrategyOriginVault is BaseCooldownStrategy {
     error RedemptionAlreadyClaimed();
     error RedemptionNotClaimable();
     error PremintFailed();
+    /// @notice emergencyClaim/emergencyClearRedemptions refused: the target redemption is backed by a CooldownVault
+    ///         predeposit and must be settled via the normal CooldownVault.retrieveDebt path
+    error BackedRedemptionNotEmergencyClaimable(uint256 redeemIndex);
 
     // ============================================
     // STATE VARIABLES
@@ -65,6 +68,14 @@ contract StrategyOriginVault is BaseCooldownStrategy {
 
     /// @notice Reserve ratio in basis points (0 = no reserve, 100 = 1%)
     uint256 public reserveRatioBps;
+
+    /// @notice Reverse lookup: redeemIndex -> predepositId for backed redemptions.
+    /// @dev Populated in `premintCooldownVault` alongside `isBackedRedemption[redeemIndex] = true`.
+    ///      Used by `emergencyClearRedemptions` to atomically settle the linked CooldownVault
+    ///      predeposit debt (via `cooldownVault.writeOffPredepositDebt`) when forcibly clearing
+    ///      stuck redemptions, so the debt ledger does not get permanently stuck.
+    /// @dev MUST be the LAST state variable to preserve upgrade-safe storage layout.
+    mapping(uint256 => uint256) public backedRedeemToPredeposit;
 
     // ============================================
     // STRUCTS
@@ -264,6 +275,7 @@ contract StrategyOriginVault is BaseCooldownStrategy {
             totalUnbackedRedemptionShares -= request.shares;
         }
         delete isBackedRedemption[redeemIndex];
+        delete backedRedeemToPredeposit[redeemIndex];
 
         emit RedemptionClaimed(redeemIndex, claimedAmount);
 
@@ -397,17 +409,20 @@ contract StrategyOriginVault is BaseCooldownStrategy {
         }
     }
 
-    /// @notice Emergency claim passthrough with explicit event and warning about double-counting
-    /// @dev IMPORTANT: DOUBLE-COUNTING RISK (`test_claimWithoutDebtRepaymentInflatesETAAndHarvestProfit`)
-    ///      If this redemption has an associated predeposit, calling this function WITHOUT
-    ///      immediately calling CooldownVault.retrieveDebt() will cause estimatedTotalAssets()
-    ///      to DOUBLE-COUNT the value until debt is settled:
-    ///      1. Once as CooldownVault shares (from predeposit) in want.balanceOf
-    ///      2. Once as claimed underlying assets in externalUnderlyingToken.balanceOf
-    ///      This inflates reported total assets and can affect harvest calculations, share pricing,
-    ///      and withdrawal accounting. The double-counting persists until retrieveDebt() is called.
-    ///
-    ///      TL;DR: IF YOU USE THIS, DO NOT HARVEST BEFORE REPAYING ALL OUTSTANDING DEBT TO COOLDOWNVAULT
+    /// @notice Emergency claim for an UNBACKED redemption (created via `emergencyRedeem`)
+    /// @dev Backed redemptions (created via the predeposit path, `isBackedRedemption[redeemIndex] == true`)
+    ///      are intentionally NOT eligible here. Their only sanctioned settlement path is
+    ///      `CooldownVault.retrieveDebt(predepositId)`, which atomically:
+    ///        1. calls `repayPredepositDebt` -> `requestClaim` to pull underlying from OriginVault,
+    ///        2. reduces `totalDebt` / `strategyDebtOutstanding`,
+    ///        3. records any shortfall, and
+    ///        4. marks `predepositRequest.claimed = true`.
+    ///      Allowing a backed redemption to be closed via `emergencyClaim` would set
+    ///      `request.isClaimed = true` (so `predepositDebtRetrievable` returns false), permanently
+    ///      blocking `retrieveDebt` while leaving the CooldownVault debt ledger and migration guard
+    ///      (`_requireNoOutstandingDebt`) stuck. Governance can call `retrieveDebt` directly
+    ///      (it is keeper-gated to also accept governance/management), so no separate emergency
+    ///      override for backed redemptions is needed.
     function emergencyClaim(uint256 redeemIndex)
         external
         override
@@ -415,6 +430,9 @@ contract StrategyOriginVault is BaseCooldownStrategy {
         nonReentrant
         returns (bool success, uint256 claimedAmount)
     {
+        if (isBackedRedemption[redeemIndex]) {
+            revert BackedRedemptionNotEmergencyClaimable(redeemIndex);
+        }
         (success, claimedAmount) = requestClaim(redeemIndex);
         if (success) {
             emit EmergencyClaim(redeemIndex, claimedAmount);
@@ -422,25 +440,59 @@ contract StrategyOriginVault is BaseCooldownStrategy {
     }
 
     /// @notice Force clear all redemption tracking state for emergency migration
-    /// @dev DANGEROUS: Only use when redemptions are stuck and normal migration is blocked
-    ///      This does NOT claim or cancel the actual redemptions in the external vault.
-    ///      The new strategy or governance must handle those separately.
+    /// @dev DANGEROUS: Only use when redemptions are stuck and normal `CooldownVault.retrieveDebt`
+    ///      cannot succeed (external vault frozen, malfunctioning, etc.). Governance is set as
+    ///      operator on OriginVault so any pending redemptions can be claimed manually off this
+    ///      strategy's bookkeeping.
+    ///
+    ///      For BACKED redemptions, this function atomically reconciles the linked
+    ///      CooldownVault predeposit ledger by calling `cooldownVault.writeOffPredepositDebt`:
+    ///        - the predeposit is marked claimed (so subsequent retrieveDebt reverts cleanly with
+    ///          `DebtAlreadyRepaid` instead of underflowing in the strategy);
+    ///        - the full debt is moved into `strategyShortfall`, leaving `totalDebt` unchanged
+    ///          until shortfall is later repaid (`retrieveShortfall` after recovery) or absorbed
+    ///          (`absorbStrategyShortfall` if permanently lost);
+    ///        - the strategy's mirror `remainingPredepositDebt` is incremented by the same amount
+    ///          so the existing `emergencyRepayRemainingPredepositDebt` flow works after recovery.
+    ///
+    ///      Without this reconciliation the CooldownVault debt ledger would stay nonzero forever
+    ///      and the migration guard `_requireNoOutstandingDebt` would block strategy migration.
     function emergencyClearRedemptions() external onlyGovernance {
         if (activeRedemptionIds.length() == 0) revert NoActiveRedemptions();
 
-        //Set governance as operator to handle pending claims manually
+        // Set governance as operator so pending OriginVault redemptions can be claimed manually.
         originVault.setOperator(msg.sender, true);
 
         uint256 count = activeRedemptionIds.length();
 
-        // Clear all active redemption IDs
         while (activeRedemptionIds.length() > 0) {
-            activeRedemptionIds.remove(activeRedemptionIds.at(0));
-        }
+            uint256 redeemIndex = activeRedemptionIds.at(0);
+            RedemptionRequest storage request = redemptionRequests[redeemIndex];
+            uint256 reqShares = request.shares;
 
-        // Reset tracking variables
-        totalSharesInRedemption = 0;
-        totalUnbackedRedemptionShares = 0;
+            if (isBackedRedemption[redeemIndex]) {
+                // Backed: atomically settle the linked CooldownVault predeposit as a shortfall.
+                uint256 predepositId = backedRedeemToPredeposit[redeemIndex];
+                // predepositId == 0 should never happen for a backed redemption (the reverse map
+                // is populated alongside `isBackedRedemption[redeemIndex] = true` in
+                // premintCooldownVault), but skip the writeOff defensively if it is to avoid
+                // calling into the vault with an invalid id and bricking the entire clear loop.
+                if (predepositId != 0) {
+                    uint256 writtenOff = cooldownVault.writeOffPredepositDebt(predepositId);
+                    remainingPredepositDebt += writtenOff;
+                    delete externalRedeemIndexes[predepositId];
+                }
+                delete isBackedRedemption[redeemIndex];
+                delete backedRedeemToPredeposit[redeemIndex];
+            } else {
+                // Unbacked: just keep the unbacked counter consistent (no CooldownVault interaction).
+                totalUnbackedRedemptionShares -= reqShares;
+            }
+
+            totalSharesInRedemption -= reqShares;
+            activeRedemptionIds.remove(redeemIndex);
+            delete redemptionRequests[redeemIndex];
+        }
 
         emit ForceMigrationInitiated(address(0), count);
     }
@@ -603,6 +655,7 @@ contract StrategyOriginVault is BaseCooldownStrategy {
 
         if (predepositId != 0 && preShares > 0) {
             isBackedRedemption[redeemIndex] = true;
+            backedRedeemToPredeposit[redeemIndex] = predepositId;
         } else {
             revert PremintFailed();
         }

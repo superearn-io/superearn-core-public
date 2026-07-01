@@ -336,12 +336,30 @@ contract OriginVault is
         return balance > locked ? balance - locked : 0;
     }
 
-    /// @dev Agent handles overlap prevention between outbound assets and the remote reports.
+    /// @dev Combines the peer's reported totalAssets with this chain's accountant breakdown.
+    ///      Subtraction is performed in this vault's accounting unit (USDT):
+    ///         reportedInUsdt = USDC/USDT (or peer-asset/USDT) price conversion of reportedAssets
+    ///         inflightInUsdt = postSnapshotInflight + inboundOverlap (already in local bridge
+    ///                          token, which by deployment invariant equals this vault's asset)
+    ///         remote          = max(reportedInUsdt - inflightInUsdt, 0)
+    ///      The accountant intentionally returns raw components because it has no chain-specific
+    ///      price oracle on hand (Orakl on Kaia vs Chainlink on Ethereum), while this vault
+    ///      already owns `priceConverter` for exactly this conversion.
     function remoteAssets() public view returns (uint256) {
         if (address(agent) == address(0)) return 0;
-        (uint256 remoteReportedAssets, uint8 remoteAssetDecimals) = agent.getTruePeerAssets();
-        if (remoteReportedAssets == 0) return 0;
-        return convertAssetToUsdt(remoteReportedAssets, remoteAssetDecimals);
+        (
+            uint256 reportedAssets,
+            uint256 postSnapshotInflight,
+            uint256 inboundOverlap,
+            uint8 peerAssetDecimals
+        ) = agent.getPeerAssetsBreakdown();
+
+        if (reportedAssets == 0) return 0;
+
+        uint256 reportedInUsdt = convertAssetToUsdt(reportedAssets, peerAssetDecimals);
+        uint256 inflightInUsdt = postSnapshotInflight + inboundOverlap;
+
+        return reportedInUsdt > inflightInUsdt ? reportedInUsdt - inflightInUsdt : 0;
     }
 
     function assetsInTransitToRemote() public view returns (uint256) {

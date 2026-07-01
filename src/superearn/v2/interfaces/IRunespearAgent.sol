@@ -128,11 +128,19 @@ interface IRunespearAgent {
     function getAssetsInTransit() external view returns (uint256);
 
     /**
-     * @notice Get true peer assets (with overlap removed)
-     * @dev Vault calls this for remoteAssets calculation
-     *      Agent gets report from adapter, resolves asset type, and returns amount + decimals
-     * @return assets True peer assets (reported minus overlap)
-     * @return assetDecimals Decimals of the reported asset (resolved via assetType)
+     * @notice Get the raw breakdown needed to compute the peer's true assets
+     * @dev Pass-through of `IBridgeAccountant.getPeerAssetsBreakdown` plus a peerAssetType→
+     *      peerAssetDecimals translation. The vault MUST normalize across asset units before
+     *      subtracting — see `BridgeAccountant.getPeerAssetsBreakdown` for rationale.
+     * @return reportedAssets        Peer's last reported totalAssets, in peer's asset units
+     * @return postSnapshotInflight  Inbound receives initiated AFTER the peer snapshot, in
+     *                               local bridge-token units
+     * @return inboundOverlap        Inbound receives still tracked as outbound on the peer
+     *                               at snapshot time, in local bridge-token units
+     * @return peerAssetDecimals     Decimals of the peer's reported asset
      */
-    function getTruePeerAssets() external view returns (uint256 assets, uint8 assetDecimals);
+    function getPeerAssetsBreakdown()
+        external
+        view
+        returns (uint256 reportedAssets, uint256 postSnapshotInflight, uint256 inboundOverlap, uint8 peerAssetDecimals);
 }

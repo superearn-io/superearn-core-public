@@ -368,52 +368,54 @@ contract BridgeAccountant is Initializable, IBridgeAccountant, SuperEarnAccessCo
     }
 
     /**
-     * @notice Calculate true peer assets (reported minus overlap, adjusted for timing)
-     * @dev Used by vault for remoteAssets() calculation
+     * @notice Return the raw components needed to compute the peer's true assets
      *
-     * Formula: peerReportedAssets - receivesNewerThanSnapshot - inboundOverlap
+     * @dev The accountant deliberately does NOT subtract anything itself. The two inflight
+     *      components (`postSnapshotInflight`, `inboundOverlap`) are denominated in this
+     *      chain's LOCAL bridge token (enforced by `CrosschainAdapter._processBridgeReceived`,
+     *      which requires the inbound token to equal `bridgeToken`). `reportedAssets`, in
+     *      contrast, is denominated in the PEER vault's asset (`peerAssetType`), which may
+     *      differ. Subtracting integers across those denominations is unsafe (a USDC/USDT
+     *      depeg would corrupt the result), and the accountant has no chain-appropriate price
+     *      oracle on hand (Orakl on Kaia uses a USDC/USDT direct pair, Chainlink on Ethereum
+     *      only exposes USD-base feeds — they need different aggregation logic).
      *
-     * Example 1 (Normal case):
-     * - Peer reports totalAssets = 1000 USDC
-     * - Peer's snapshot shows outboundAwaitingPeerReceipt = [10] (sent 100 USDC to us)
-     * - We already received nonce 10 (100 USDC in our vault)
-     * - Overlap = 100 USDC
-     * - True peer assets = 1000 - 100 = 900 USDC ✓
+     *      Callers (typically the Origin vault, which already owns the chain-appropriate
+     *      price converter) MUST:
+     *        1. Convert `reportedAssets` from `peerAssetType` into the vault's accounting unit.
+     *        2. Sum the inflight components — they are already in the local bridge token, which
+     *           by invariant equals the vault's accounting unit (vault.asset == bridgeToken).
+     *        3. Subtract in that unified unit, clamping at zero.
      *
-     * Example 2 (Stale snapshot - THE BUG THIS FIXES):
-     * - Peer snapshot at T=1000: totalAssets = 1000 USDC, outboundAwaitingPeerReceipt = []
-     * - Peer sends 500 USDC at T=2000 (nonce=10) - AFTER snapshot
-     * - We receive 500 USDC at T=3000 (timestamp=3000)
-     * - receivesNewerThanSnapshot = 500 (received after T=1000)
-     * - overlap = 0 (no matching nonces in snapshot's outboundAwaitingPeerReceipt)
-     * - True peer assets = 1000 - 500 - 0 = 500 USDC ✓
-     * - (Without fix: would be 1000 - 0 = 1000, causing double-counting!)
+     *      Example (Kaia OriginVault, asset=USDT, peer=Ethereum reporting in USDC):
+     *        reportedInUsdt   = priceConverter.convert(reportedAssets, USDC→USDT)
+     *        inflightInUsdt   = postSnapshotInflight + inboundOverlap   // already USDT
+     *        remoteAssets()   = max(reportedInUsdt - inflightInUsdt, 0)
      *
-     * @return assets True peer assets (overlap-adjusted and timing-adjusted)
-     * @return assetType Asset denomination reported in peer snapshot
+     * @return reportedAssets        Peer's last reported totalAssets, in `peerAssetType` units
+     * @return postSnapshotInflight  Sum of inbound receives initiated AFTER the peer snapshot
+     *                               (peer's totalAssets does not yet reflect them), in LOCAL
+     *                               bridge-token units
+     * @return inboundOverlap        Sum of inbound receives whose nonces the peer still has in
+     *                               outboundAwaitingPeerReceipt at snapshot time, in LOCAL
+     *                               bridge-token units
+     * @return peerAssetType         Asset denomination of `reportedAssets`
      */
-    function calculateTruePeerAssets()
+    function getPeerAssetsBreakdown()
         external
         view
         override
-        returns (uint256 assets, SuperEarnV2Protocol.AssetType assetType)
+        returns (
+            uint256 reportedAssets,
+            uint256 postSnapshotInflight,
+            uint256 inboundOverlap,
+            SuperEarnV2Protocol.AssetType peerAssetType
+        )
     {
-        uint256 reportedAssets = peerSnapshot.vaultState.totalAssets;
-        assetType = peerSnapshot.vaultState.assetType;
-
-        // First: subtract receives that came AFTER the peer's snapshot
-        // These assets were sent by peer AFTER their snapshot was taken,
-        // so they're NOT reflected in peer's reported totalAssets yet,
-        // but they ARE in our local balance already.
-        uint256 receivesNewerThanSnapshot = _calculateReceivesNewerThanSnapshot();
-        uint256 adjustedReported =
-            reportedAssets > receivesNewerThanSnapshot ? reportedAssets - receivesNewerThanSnapshot : 0;
-
-        // Then: subtract normal overlap (for receives BEFORE snapshot)
-        uint256 overlap = this.calculateInboundOverlap();
-
-        assets = adjustedReported > overlap ? adjustedReported - overlap : 0;
-        return (assets, assetType);
+        reportedAssets = peerSnapshot.vaultState.totalAssets;
+        peerAssetType = peerSnapshot.vaultState.assetType;
+        postSnapshotInflight = _calculateReceivesNewerThanSnapshot();
+        inboundOverlap = this.calculateInboundOverlap();
     }
 
     /**

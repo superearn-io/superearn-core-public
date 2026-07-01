@@ -159,15 +159,27 @@ interface IBridgeAccountant {
     function calculateInboundOverlap() external view returns (uint256);
 
     /**
-     * @notice Calculate true peer assets (reported minus overlap)
-     * @dev Used by vault for remoteAssets() calculation
-     * @return assets True peer assets (overlap-adjusted)
-     * @return assetType Asset denomination reported by peer
+     * @notice Return the raw components needed to compute the peer's true assets
+     * @dev The accountant intentionally does NOT subtract — inflight is in local bridge-token
+     *      units while reportedAssets is in `peerAssetType` units; callers (e.g. OriginVault)
+     *      must normalize to a single unit using a chain-appropriate price converter before
+     *      subtracting. See BridgeAccountant.getPeerAssetsBreakdown for details.
+     * @return reportedAssets        Peer's last reported totalAssets, in `peerAssetType` units
+     * @return postSnapshotInflight  Inbound receives initiated AFTER the peer snapshot, in
+     *                               local bridge-token units
+     * @return inboundOverlap        Inbound receives still in peer outboundAwaitingPeerReceipt
+     *                               at snapshot time, in local bridge-token units
+     * @return peerAssetType         Asset denomination of `reportedAssets`
      */
-    function calculateTruePeerAssets()
+    function getPeerAssetsBreakdown()
         external
         view
-        returns (uint256 assets, SuperEarnV2Protocol.AssetType assetType);
+        returns (
+            uint256 reportedAssets,
+            uint256 postSnapshotInflight,
+            uint256 inboundOverlap,
+            SuperEarnV2Protocol.AssetType peerAssetType
+        );
 
     /**
      * @notice Get peer's reported total assets (from snapshot)

@@ -270,13 +270,21 @@ abstract contract OriginVaultBase is Initializable, ERC20Upgradeable, OwnableUpg
      * variables without shifting down storage in the inheritance chain.
      * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
      *
-     * Storage usage: 5 slots
+     * Storage usage: 4 physical slots (5 declared variables; `share` + `_decimalsOffset`
+     * share one slot via Solidity packing):
      *   - asset: 1 slot (address)
-     *   - share: 1 slot (address)
-     *   - _decimalsOffset: 1 slot (uint8, padded to 1 slot)
+     *   - share + _decimalsOffset: 1 slot (address 20B + uint8 1B packed together)
      *   - isOperator (mapping pointer): 1 slot
      *   - authorizations (mapping pointer): 1 slot
-     * Gap = 50 - 5 = 45
+     *
+     * Block = 4 vars + 45 gap = 49 slots, NOT the usual 50 (an earlier comment miscounted
+     * `_decimalsOffset` as its own slot). `__gap` is FROZEN at 45 and MUST NOT be changed:
+     * OriginVaultBase is an inherited base of the deployed `OriginVault` proxy, so resizing
+     * this gap (e.g. to 46 to "make it 50") would shift every downstream inherited slot
+     * (Pausable / ReentrancyGuard / AccessControl) and `OriginVault`'s own state by one slot
+     * and corrupt live storage. The 49-slot block is self-consistent with the deployment;
+     * leave it. Any NEW variable must be appended by subtracting from this 45-slot gap.
+     * See CLAUDE.md "Storage Gap (`__gap`) Convention".
      */
     uint256[45] private __gap;
 }

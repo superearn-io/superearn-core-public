@@ -832,22 +832,25 @@ contract CrosschainAdapter is
      * variables without shifting down storage in the inheritance chain.
      * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
      *
-     * Storage usage: 10 slots (CrosschainAdapter itself)
-     *   - vault: 1 slot (address)
-     *   - originChainId: 1 slot (uint256)
-     *   - remoteChainId: 1 slot (uint256)
-     *   - peerVault: 1 slot (address)
-     *   - agent: 1 slot (address)
-     *   - bridgeDepositAddress: 1 slot (address)
-     *   - authorizedBridges (mapping pointer): 1 slot
-     *   - peerAdapter: 1 slot (address)
-     *   - _localVaultRole / _localVaultRoleConfigured: 1 slot (packed enum + bool)
-     *   - assetTypeToToken (mapping pointer): 1 slot
+     * Storage usage: 9 slots (CrosschainAdapter itself) — 11 declarations, slots 451..459.
+     * Count SLOTS not declarations (CLAUDE.md rule 1): three of the declarations pack into
+     * one slot.
+     *   - vault: 1 slot (address)                         [slot 451]
+     *   - originChainId: 1 slot (uint256)                 [slot 452]
+     *   - remoteChainId: 1 slot (uint256)                 [slot 453]
+     *   - peerVault: 1 slot (address)                     [slot 454]
+     *   - agent: 1 slot (address)                         [slot 455]
+     *   - bridgeDepositAddress: 1 slot (address)          [slot 456]
+     *   - lastMessageSentAt: 1 slot (uint256)             [slot 457]
+     *   - peerAdapter + _localVaultRole + _localVaultRoleConfigured: 1 slot (packed
+     *       address[20B] + enum[1B] + bool[1B])           [slot 458]
+     *   - assetTypeToToken (mapping pointer): 1 slot      [slot 459]
      *
      * Note: Storage consumed by inherited contracts (RunespearReceiver/Sender, AccessControl, ReentrancyGuard)
      * is accounted for in their own implementations.
      *
-     * Gap = 50 - 10 = 40
+     * Block = 9 own + 41 gap = 50. CrosschainAdapter is a leaf (most-derived; nothing inherits
+     * it), so this trailing gap is pure reserve. Gap = 50 - 9 = 41
      */
-    uint256[40] private __gap;
+    uint256[41] private __gap;
 }
